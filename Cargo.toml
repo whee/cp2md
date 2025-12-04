@@ -1,0 +1,27 @@
+[package]
+categories   = ["command-line-utilities", "text-processing"]
+description  = "Convert GitHub Copilot chat exports to Markdown"
+edition      = "2024"
+keywords     = ["copilot", "markdown", "converter", "chat", "export"]
+license      = "GPL-3.0-only"
+name         = "cp2md"
+readme       = "README.md"
+repository   = "https://github.com/whee/cp2md"
+rust-version = "1.91"
+version      = "1.0.0"
+
+[dependencies]
+chrono     = { version = "0.4", features = ["serde"] }
+lexopt     = "0.3"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+snafu      = "0.8"
+walkdir    = "2"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+module_name_repetitions = "allow"
+nursery                 = { level = "warn", priority = -1 }
+pedantic                = { level = "warn", priority = -1 }
