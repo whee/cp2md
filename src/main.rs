@@ -103,6 +103,12 @@ Options:
 }
 
 fn parse_args() -> Result<Cli, lexopt::Error> {
+    // Show help if no arguments provided
+    if std::env::args().len() == 1 {
+        print_help();
+        std::process::exit(0);
+    }
+
     let mut input = Vec::new();
     let mut output: Option<OutputTarget> = None;
     let mut concat = false;
