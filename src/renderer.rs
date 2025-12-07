@@ -138,14 +138,18 @@ fn render_request(out: &mut String, req: &Request, opts: &RenderOptions) {
     if !metadata.is_empty() {
         writeln!(out, "{metadata}\n").unwrap();
     }
-    writeln!(out, "{}\n", escape_xml_tags(&req.message.text)).unwrap();
+    // Shift headings in user content to prevent them from competing with
+    // our document structure (H1 title, H2 sections). Shift by 2 + offset
+    // so user H1 becomes H3+ (below our H2 section headers).
+    let shifted = shift_headings(&req.message.text, 2 + opts.heading_offset);
+    writeln!(out, "{}\n", escape_xml_tags(&shifted)).unwrap();
 
     if opts.show_tools {
         render_tool_invocations(out, &req.response);
     }
 
     writeln!(out, "{} Assistant\n", heading(2, opts.heading_offset)).unwrap();
-    render_response(out, &req.response);
+    render_response(out, &req.response, opts);
 }
 
 fn render_tool_invocations(out: &mut String, elements: &[ResponseElement]) {
@@ -164,7 +168,7 @@ fn render_tool_invocations(out: &mut String, elements: &[ResponseElement]) {
     }
 }
 
-fn render_response(out: &mut String, elements: &[ResponseElement]) {
+fn render_response(out: &mut String, elements: &[ResponseElement], opts: &RenderOptions) {
     for elem in elements {
         match elem {
             ResponseElement::Text(text) => {
@@ -172,7 +176,9 @@ fn render_response(out: &mut String, elements: &[ResponseElement]) {
                 if trimmed.is_empty() || is_only_code_fences(trimmed) {
                     continue;
                 }
-                out.push_str(&escape_xml_tags(text));
+                // Shift headings in assistant content to match user content treatment
+                let shifted = shift_headings(text, 2 + opts.heading_offset);
+                out.push_str(&escape_xml_tags(&shifted));
             }
             ResponseElement::InlineReference { name, path } => {
                 let display = name
@@ -217,6 +223,49 @@ fn is_only_code_fences(s: &str) -> bool {
 /// syntax when displaying filenames that contain backticks.
 fn escape_for_inline_code(s: &str) -> String {
     s.replace('`', "'")
+}
+
+/// Shifts Markdown heading levels down by a specified amount.
+///
+/// This prevents user-supplied content from injecting top-level structure
+/// into the rendered output. For example, with a shift of 2, a `## Heading`
+/// in user content becomes `#### Heading`.
+///
+/// Headings inside fenced code blocks are left unchanged.
+/// Caps at H6 (######) since Markdown doesn't support deeper heading levels.
+fn shift_headings(s: &str, levels: u8) -> String {
+    if levels == 0 {
+        return s.to_string();
+    }
+
+    let mut result = Vec::new();
+    let mut in_code_block = false;
+
+    for line in s.lines() {
+        let trimmed = line.trim_start();
+
+        // Track fenced code block boundaries
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_code_block = !in_code_block;
+            result.push(line.to_string());
+            continue;
+        }
+
+        // Only transform headings outside code blocks
+        if !in_code_block && line.starts_with('#') {
+            let hash_count = line.chars().take_while(|&c| c == '#').count();
+            // Valid ATX heading: 1-6 hashes followed by a space
+            if hash_count <= 6 && line.chars().nth(hash_count) == Some(' ') {
+                let new_level = (hash_count + levels as usize).min(6);
+                result.push(format!("{}{}", "#".repeat(new_level), &line[hash_count..]));
+                continue;
+            }
+        }
+
+        result.push(line.to_string());
+    }
+
+    result.join("\n")
 }
 
 /// Escapes XML/HTML-like tags so they render literally in Markdown.
@@ -670,5 +719,117 @@ mod tests {
         // Should have a blank line before the second "## User"
         // The pattern should be: response text, newline, newline, "## User"
         assert!(output.contains("First answer\n\n## User"));
+    }
+
+    // Tests for shift_headings helper
+    #[test]
+    fn shift_headings_basic() {
+        assert_eq!(shift_headings("# H1", 2), "### H1");
+        assert_eq!(shift_headings("## H2", 2), "#### H2");
+        assert_eq!(shift_headings("### H3", 2), "##### H3");
+    }
+
+    #[test]
+    fn shift_headings_caps_at_h6() {
+        assert_eq!(shift_headings("##### H5", 2), "###### H5");
+        assert_eq!(shift_headings("###### H6", 2), "###### H6");
+        assert_eq!(shift_headings("#### H4", 3), "###### H4");
+    }
+
+    #[test]
+    fn shift_headings_preserves_content_after_heading() {
+        assert_eq!(
+            shift_headings("## Title with **bold** and `code`", 2),
+            "#### Title with **bold** and `code`"
+        );
+    }
+
+    #[test]
+    fn shift_headings_multiline() {
+        let input = "## First\n\nSome text\n\n### Second";
+        let expected = "#### First\n\nSome text\n\n##### Second";
+        assert_eq!(shift_headings(input, 2), expected);
+    }
+
+    #[test]
+    fn shift_headings_ignores_non_headings() {
+        // No space after # - not a heading
+        assert_eq!(shift_headings("#hashtag", 2), "#hashtag");
+        // Just hashes
+        assert_eq!(shift_headings("###", 2), "###");
+        // Regular text
+        assert_eq!(shift_headings("regular text", 2), "regular text");
+    }
+
+    #[test]
+    fn shift_headings_skips_code_blocks() {
+        let input = "## Real heading\n\n```\n## Not a heading\n```\n\n## Another real one";
+        let expected = "#### Real heading\n\n```\n## Not a heading\n```\n\n#### Another real one";
+        assert_eq!(shift_headings(input, 2), expected);
+    }
+
+    #[test]
+    fn shift_headings_skips_tilde_code_blocks() {
+        let input = "## Heading\n\n~~~\n# Code comment\n~~~";
+        let expected = "#### Heading\n\n~~~\n# Code comment\n~~~";
+        assert_eq!(shift_headings(input, 2), expected);
+    }
+
+    #[test]
+    fn shift_headings_handles_nested_code_blocks() {
+        let input = "## Start\n\n```\ncode\n```\n\n## Middle\n\n```\nmore\n```\n\n## End";
+        let expected = "#### Start\n\n```\ncode\n```\n\n#### Middle\n\n```\nmore\n```\n\n#### End";
+        assert_eq!(shift_headings(input, 2), expected);
+    }
+
+    #[test]
+    fn shift_headings_empty_input() {
+        assert_eq!(shift_headings("", 2), "");
+    }
+
+    #[test]
+    fn shift_headings_preserves_leading_whitespace() {
+        // Indented headings aren't valid Markdown headings, should be unchanged
+        assert_eq!(shift_headings("  ## Indented", 2), "  ## Indented");
+    }
+
+    #[test]
+    fn shift_headings_zero_shift() {
+        assert_eq!(shift_headings("## Heading", 0), "## Heading");
+    }
+
+    #[test]
+    fn user_message_headings_are_shifted() {
+        let chat = make_chat(vec![make_request(
+            "## My Heading\n\nSome content\n\n### Subheading",
+            vec![ResponseElement::Text("Response".into())],
+        )]);
+        let output = render_chat(&chat, &default_opts());
+
+        // User's ## should become #### (shifted by 2)
+        assert!(output.contains("#### My Heading"));
+        // User's ### should become ##### (shifted by 2)
+        assert!(output.contains("##### Subheading"));
+        // Our structure should remain unchanged
+        assert!(output.contains("## User"));
+        assert!(output.contains("## Assistant"));
+    }
+
+    #[test]
+    fn user_message_headings_shifted_with_offset() {
+        let chat = make_chat(vec![make_request(
+            "# Top heading",
+            vec![ResponseElement::Text("Response".into())],
+        )]);
+        let opts = RenderOptions {
+            heading_offset: 1,
+            ..Default::default()
+        };
+        let output = render_chat(&chat, &opts);
+
+        // With offset 1: our H2 becomes H3, so user H1 shifts by 3 → H4
+        assert!(output.contains("#### Top heading"));
+        // Our structure uses offset
+        assert!(output.contains("### User"));
     }
 }
