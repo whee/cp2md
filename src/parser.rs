@@ -144,7 +144,8 @@ impl<'de> Deserialize<'de> for ResponseElement {
         if let Some(kind) = get_str(&value, &["kind"]) {
             return Ok(match kind {
                 "inlineReference" => Self::InlineReference {
-                    name: get_string(&value, &["name"]),
+                    name: get_string(&value, &["name"])
+                        .or_else(|| get_string(&value, &["inlineReference", "name"])),
                     path: get_str(&value, &["inlineReference", "path"])
                         .unwrap_or_default()
                         .to_owned(),
@@ -323,6 +324,31 @@ mod tests {
             ResponseElement::InlineReference { name, path } => {
                 assert!(name.is_none());
                 assert_eq!(path, "/src/lib.rs");
+            }
+            other => panic!("Expected InlineReference, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_inline_reference_with_nested_name() {
+        // Symbol references (functions, types) have the name inside inlineReference
+        let json = minimal_chat_json(&request_json(
+            "Check symbol",
+            r#"{
+                "kind": "inlineReference",
+                "inlineReference": {
+                    "name": "Deserialize",
+                    "kind": 12,
+                    "location": { "range": {} }
+                }
+            }"#,
+        ));
+        let chat = parse_chat(&json).unwrap();
+
+        match &chat.requests[0].response[0] {
+            ResponseElement::InlineReference { name, path } => {
+                assert_eq!(name.as_deref(), Some("Deserialize"));
+                assert_eq!(path, ""); // No path for symbol references
             }
             other => panic!("Expected InlineReference, got {other:?}"),
         }
