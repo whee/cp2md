@@ -64,8 +64,7 @@ pub struct ChatExport {
 ///
 /// Each request represents one user message and the corresponding
 /// assistant response, along with metadata like timestamps and model info.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     /// Unix timestamp in milliseconds when the request was made.
     pub timestamp: i64,
@@ -75,11 +74,57 @@ pub struct Request {
     /// May be `None` for older exports or when the model info is unavailable.
     pub model_id: Option<String>,
 
+    /// The VS Code agent used for this request (e.g., "agent", "documentation-reviewer").
+    ///
+    /// May be `None` for older exports.
+    pub agent_name: Option<String>,
+
+    /// Context items attached to this request (files, selections, instruction files).
+    pub context: Vec<ContextItem>,
+
     /// The user's message that initiated this request.
     pub message: Message,
 
     /// The assistant's response, which may contain multiple elements.
     pub response: Vec<ResponseElement>,
+}
+
+/// A context item attached to a request.
+///
+/// Represents files, selections, folders, or instruction files that were
+/// included as context for the conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextItem {
+    /// A file reference.
+    File {
+        /// Display name (e.g., "main.rs").
+        name: String,
+        /// Full file path.
+        path: String,
+    },
+    /// A text selection within a file.
+    Selection {
+        /// Display name (e.g., "main.rs").
+        name: String,
+        /// Full file path.
+        path: String,
+        /// Starting line number (1-indexed).
+        start_line: u32,
+        /// Ending line number (1-indexed).
+        end_line: u32,
+    },
+    /// A folder reference.
+    Folder {
+        /// Display name (e.g., "src/").
+        name: String,
+        /// Full folder path.
+        path: String,
+    },
+    /// An instruction/prompt file.
+    Instructions {
+        /// Display name (e.g., "copilot-instructions.md").
+        name: String,
+    },
 }
 
 /// A user message in the conversation.
@@ -177,6 +222,129 @@ impl<'de> Deserialize<'de> for ResponseElement {
     }
 }
 
+impl<'de> Deserialize<'de> for Request {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+
+        let timestamp = value
+            .get("timestamp")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+
+        let model_id = get_string(&value, &["modelId"]);
+        let agent_name = get_string(&value, &["agent", "name"]);
+
+        let message = value
+            .get("message")
+            .and_then(|m| serde_json::from_value(m.clone()).ok())
+            .unwrap_or(Message {
+                text: String::new(),
+            });
+
+        let response = value
+            .get("response")
+            .and_then(|r| serde_json::from_value(r.clone()).ok())
+            .unwrap_or_default();
+
+        let context = extract_context(&value);
+
+        Ok(Self {
+            timestamp,
+            model_id,
+            agent_name,
+            context,
+            message,
+            response,
+        })
+    }
+}
+
+/// Extracts context items from the variableData.variables array.
+fn extract_context(value: &serde_json::Value) -> Vec<ContextItem> {
+    let variables = match value.get("variableData").and_then(|v| v.get("variables")) {
+        Some(v) => v.as_array(),
+        None => return Vec::new(),
+    };
+
+    let Some(variables) = variables else {
+        return Vec::new();
+    };
+
+    let mut items = Vec::new();
+
+    for var in variables {
+        let kind = get_str(var, &["kind"]).unwrap_or("");
+        let name = get_string(var, &["name"]).unwrap_or_default();
+        let id = get_string(var, &["id"]).unwrap_or_default();
+
+        match kind {
+            "file" => {
+                // Get path from value.uri.path or value.path
+                let path = get_string(var, &["value", "uri", "path"])
+                    .or_else(|| get_string(var, &["value", "path"]))
+                    .unwrap_or_default();
+
+                // Check if this is a selection (has range with line numbers)
+                if let Some(range) = var.get("value").and_then(|v| v.get("range")) {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let start_line = range
+                        .get("startLineNumber")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(1) as u32;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let end_line = range
+                        .get("endLineNumber")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_else(|| u64::from(start_line)) as u32;
+
+                    // Only treat as selection if it's actually a selection (not whole file)
+                    if id.contains("selection") || start_line != end_line || start_line > 1 {
+                        items.push(ContextItem::Selection {
+                            name: clean_context_name(&name),
+                            path,
+                            start_line,
+                            end_line,
+                        });
+                        continue;
+                    }
+                }
+
+                items.push(ContextItem::File {
+                    name: clean_context_name(&name),
+                    path,
+                });
+            }
+            "promptFile" => {
+                items.push(ContextItem::Instructions {
+                    name: clean_context_name(&name),
+                });
+            }
+            "folder" => {
+                let path = get_string(var, &["value", "path"]).unwrap_or_default();
+                items.push(ContextItem::Folder {
+                    name: clean_context_name(&name),
+                    path,
+                });
+            }
+            // Skip "tool", "promptText", and other kinds
+            _ => {}
+        }
+    }
+
+    items
+}
+
+/// Cleans up context item names by removing prefixes like "file:" or "prompt:".
+fn clean_context_name(name: &str) -> String {
+    name.strip_prefix("file:")
+        .or_else(|| name.strip_prefix("prompt:"))
+        .unwrap_or(name)
+        .to_owned()
+}
+
 /// Navigates a JSON path and returns the string value at the end.
 ///
 /// # Arguments
@@ -262,6 +430,30 @@ mod tests {
                 "modelId": "claude-sonnet-4",
                 "message": {{ "text": "{message}" }},
                 "response": [{response_elements}]
+            }}"#
+        )
+    }
+
+    fn request_json_with_agent(message: &str, agent_name: &str) -> String {
+        format!(
+            r#"{{
+                "timestamp": 1733356800000,
+                "modelId": "claude-sonnet-4",
+                "agent": {{ "name": "{agent_name}" }},
+                "message": {{ "text": "{message}" }},
+                "response": []
+            }}"#
+        )
+    }
+
+    fn request_json_with_context(message: &str, variables_json: &str) -> String {
+        format!(
+            r#"{{
+                "timestamp": 1733356800000,
+                "modelId": "claude-sonnet-4",
+                "message": {{ "text": "{message}" }},
+                "response": [],
+                "variableData": {{ "variables": [{variables_json}] }}
             }}"#
         )
     }
@@ -490,6 +682,144 @@ mod tests {
         let chat = parse_chat(json).unwrap();
 
         assert!(chat.requests[0].model_id.is_none());
+    }
+
+    #[test]
+    fn parses_agent_name() {
+        let json = minimal_chat_json(&request_json_with_agent("Hi", "documentation-reviewer"));
+        let chat = parse_chat(&json).unwrap();
+
+        assert_eq!(
+            chat.requests[0].agent_name.as_deref(),
+            Some("documentation-reviewer")
+        );
+    }
+
+    #[test]
+    fn parses_request_without_agent() {
+        let json = minimal_chat_json(&request_json("Hi", ""));
+        let chat = parse_chat(&json).unwrap();
+
+        assert!(chat.requests[0].agent_name.is_none());
+    }
+
+    #[test]
+    fn parses_file_context() {
+        let json = minimal_chat_json(&request_json_with_context(
+            "Hi",
+            r#"{
+                "kind": "file",
+                "name": "file:main.rs",
+                "value": { "uri": { "path": "/src/main.rs" } }
+            }"#,
+        ));
+        let chat = parse_chat(&json).unwrap();
+
+        assert_eq!(chat.requests[0].context.len(), 1);
+        match &chat.requests[0].context[0] {
+            ContextItem::File { name, path } => {
+                assert_eq!(name, "main.rs");
+                assert_eq!(path, "/src/main.rs");
+            }
+            other => panic!("Expected File, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_selection_context() {
+        let json = minimal_chat_json(&request_json_with_context(
+            "Hi",
+            r#"{
+                "kind": "file",
+                "id": "vscode.implicit.selection",
+                "name": "file:todo.md",
+                "value": {
+                    "uri": { "path": "/docs/todo.md" },
+                    "range": { "startLineNumber": 5, "endLineNumber": 10 }
+                }
+            }"#,
+        ));
+        let chat = parse_chat(&json).unwrap();
+
+        assert_eq!(chat.requests[0].context.len(), 1);
+        match &chat.requests[0].context[0] {
+            ContextItem::Selection {
+                name,
+                path,
+                start_line,
+                end_line,
+            } => {
+                assert_eq!(name, "todo.md");
+                assert_eq!(path, "/docs/todo.md");
+                assert_eq!(*start_line, 5);
+                assert_eq!(*end_line, 10);
+            }
+            other => panic!("Expected Selection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_instructions_context() {
+        let json = minimal_chat_json(&request_json_with_context(
+            "Hi",
+            r#"{
+                "kind": "promptFile",
+                "name": "prompt:copilot-instructions.md"
+            }"#,
+        ));
+        let chat = parse_chat(&json).unwrap();
+
+        assert_eq!(chat.requests[0].context.len(), 1);
+        match &chat.requests[0].context[0] {
+            ContextItem::Instructions { name } => {
+                assert_eq!(name, "copilot-instructions.md");
+            }
+            other => panic!("Expected Instructions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_folder_context() {
+        let json = minimal_chat_json(&request_json_with_context(
+            "Hi",
+            r#"{
+                "kind": "folder",
+                "name": "src/",
+                "value": { "path": "/project/src" }
+            }"#,
+        ));
+        let chat = parse_chat(&json).unwrap();
+
+        assert_eq!(chat.requests[0].context.len(), 1);
+        match &chat.requests[0].context[0] {
+            ContextItem::Folder { name, path } => {
+                assert_eq!(name, "src/");
+                assert_eq!(path, "/project/src");
+            }
+            other => panic!("Expected Folder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skips_tool_and_prompt_text_context() {
+        let json = minimal_chat_json(&request_json_with_context(
+            "Hi",
+            r#"
+                {"kind": "tool", "name": "Codebase"},
+                {"kind": "promptText", "name": "instructions"}
+            "#,
+        ));
+        let chat = parse_chat(&json).unwrap();
+
+        assert!(chat.requests[0].context.is_empty());
+    }
+
+    #[test]
+    fn parses_empty_context() {
+        let json = minimal_chat_json(&request_json("Hi", ""));
+        let chat = parse_chat(&json).unwrap();
+
+        assert!(chat.requests[0].context.is_empty());
     }
 
     #[test]

@@ -27,6 +27,8 @@
 //!     requests: vec![Request {
 //!         timestamp: 1733356800000,
 //!         model_id: Some("claude-sonnet-4".into()),
+//!         agent_name: None,
+//!         context: vec![],
 //!         message: Message { text: "Hello!".into() },
 //!         response: vec![ResponseElement::Text("Hi there!".into())],
 //!     }],
@@ -40,7 +42,7 @@
 //! assert!(markdown.contains("Hi there!"));
 //! ```
 
-use crate::parser::{ChatExport, Request, ResponseElement};
+use crate::parser::{ChatExport, ContextItem, Request, ResponseElement};
 use chrono::DateTime;
 use std::fmt::Write;
 use std::path::Path;
@@ -49,6 +51,7 @@ use std::path::Path;
 ///
 /// Controls which optional elements are included in the rendered output.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct RenderOptions {
     /// Whether to include tool invocation summaries in the output.
     ///
@@ -66,6 +69,17 @@ pub struct RenderOptions {
     /// When disabled, model IDs like "claude-sonnet-4" are hidden.
     pub show_model: bool,
 
+    /// Whether to include the VS Code agent name in the conversation metadata.
+    ///
+    /// When enabled, shows the agent used (e.g., "@agent", "@documentation-reviewer").
+    pub show_agent: bool,
+
+    /// Whether to include attached context in the output.
+    ///
+    /// When enabled, shows files, selections, and instruction files that were
+    /// attached to each request in a collapsible details block.
+    pub show_context: bool,
+
     /// Number of heading levels to shift (0-5).
     ///
     /// A value of 0 produces H1/H2 headings (default).
@@ -79,6 +93,8 @@ impl Default for RenderOptions {
             show_tools: false,
             show_timestamps: false,
             show_model: true,
+            show_agent: true,
+            show_context: true,
             heading_offset: 0,
         }
     }
@@ -127,17 +143,42 @@ fn render_request(out: &mut String, req: &Request, opts: &RenderOptions) {
         None
     };
 
-    let metadata = match (opts.show_timestamps, &timestamp, model_id) {
-        (true, Some(ts), Some(model)) => format!("*{ts} · {model}*"),
-        (true, Some(ts), None) => format!("*{ts}*"),
-        (false, _, Some(model)) => format!("*{model}*"),
-        _ => String::new(),
+    let agent_name = if opts.show_agent {
+        req.agent_name.as_deref()
+    } else {
+        None
+    };
+
+    // Build metadata parts
+    let mut parts: Vec<String> = Vec::new();
+    if opts.show_timestamps
+        && let Some(ts) = &timestamp
+    {
+        parts.push(ts.clone());
+    }
+    if let Some(model) = model_id {
+        parts.push(model.to_string());
+    }
+    if let Some(agent) = agent_name {
+        parts.push(format!("@{agent}"));
+    }
+
+    let metadata = if parts.is_empty() {
+        String::new()
+    } else {
+        format!("*{}*", parts.join(" · "))
     };
 
     writeln!(out, "{} User\n", heading(2, opts.heading_offset)).unwrap();
     if !metadata.is_empty() {
         writeln!(out, "{metadata}\n").unwrap();
     }
+
+    // Render context if enabled and non-empty
+    if opts.show_context && !req.context.is_empty() {
+        render_context(out, &req.context);
+    }
+
     // Shift headings in user content to prevent them from competing with
     // our document structure (H1 title, H2 sections). Shift by 2 + offset
     // so user H1 becomes H3+ (below our H2 section headers).
@@ -150,6 +191,69 @@ fn render_request(out: &mut String, req: &Request, opts: &RenderOptions) {
 
     writeln!(out, "{} Assistant\n", heading(2, opts.heading_offset)).unwrap();
     render_response(out, &req.response, opts);
+}
+
+fn render_context(out: &mut String, context: &[ContextItem]) {
+    writeln!(out, "<details>").unwrap();
+    writeln!(out, "<summary>📎 Context</summary>\n").unwrap();
+
+    for item in context {
+        let formatted = format_context_item(item);
+        writeln!(out, "- {formatted}").unwrap();
+    }
+
+    writeln!(out, "\n</details>\n").unwrap();
+}
+
+/// Formats a context item for display.
+///
+/// Uses smart path truncation: shows filename with full path in a link title
+/// for long paths (>30 chars), or just the path directly for short ones.
+fn format_context_item(item: &ContextItem) -> String {
+    match item {
+        ContextItem::File { name, path } => {
+            let display = format_path_display(name, path);
+            format!("{display} (file)")
+        }
+        ContextItem::Selection {
+            name,
+            path,
+            start_line,
+            end_line,
+        } => {
+            let range = if start_line == end_line {
+                format!(":{start_line}")
+            } else {
+                format!(":{start_line}-{end_line}")
+            };
+            let display = format_path_display(name, path);
+            format!("{display}{range} (selection)")
+        }
+        ContextItem::Folder { name, path } => {
+            let display = format_path_display(name, path);
+            format!("{display} (folder)")
+        }
+        ContextItem::Instructions { name } => {
+            format!("`{name}` (instructions)")
+        }
+    }
+}
+
+/// Formats a path for display with smart truncation.
+///
+/// For paths longer than 30 characters, shows just the filename with a
+/// Markdown link containing the full path as a title. For shorter paths,
+/// shows the path directly.
+fn format_path_display(name: &str, path: &str) -> String {
+    const MAX_INLINE_PATH_LEN: usize = 30;
+
+    if path.is_empty() || path.len() <= MAX_INLINE_PATH_LEN {
+        // Short path or no path: just show the name in backticks
+        format!("`{name}`")
+    } else {
+        // Long path: show name with full path in link title
+        format!("[`{name}`]({path} \"{path}\")")
+    }
 }
 
 fn render_tool_invocations(out: &mut String, elements: &[ResponseElement]) {
@@ -317,6 +421,8 @@ mod tests {
         Request {
             timestamp: 1_733_356_800_000, // 2024-12-05 00:00:00 UTC
             model_id: Some("claude-sonnet-4".into()),
+            agent_name: None,
+            context: vec![],
             message: Message {
                 text: message.into(),
             },

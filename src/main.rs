@@ -26,9 +26,11 @@ struct Cli {
     input: Vec<PathBuf>,
     output: OutputTarget,
     concat: bool,
-    verbose: bool,
+    show_tools: bool,
     show_timestamps: bool,
-    no_model: bool,
+    show_model: bool,
+    show_agent: bool,
+    show_context: bool,
     heading_offset: u8,
     quiet: bool,
     dry_run: bool,
@@ -88,10 +90,22 @@ Arguments:
 Options:
   -o, --output <OUTPUT>     Output directory (or file with --concat, or - for stdout)
       --concat              Combine all inputs into a single output
-  -v, --verbose             Include tool invocations in output
-      --show-timestamps     Include timestamps in conversation metadata
-      --no-model            Hide model ID from output
       --heading-offset <N>  Shift heading levels by N (0-5, default: 0)
+
+Metadata display (use --show-* or --hide-*):
+      --show-timestamps     Include timestamps (default: off)
+      --hide-timestamps     Hide timestamps
+      --show-model          Include model ID (default: on)
+      --hide-model          Hide model ID
+      --show-agent          Include agent name (default: on)
+      --hide-agent          Hide agent name
+      --show-context        Include attached context (default: on)
+      --hide-context        Hide attached context
+      --show-tools          Include tool invocations (default: off)
+      --hide-tools          Hide tool invocations
+  -v, --verbose             Alias for --show-tools
+
+Other options:
   -q, --quiet               Suppress progress messages
   -n, --dry-run             Show what would be processed without writing
   -f, --force               Overwrite existing output files
@@ -112,9 +126,12 @@ fn parse_args() -> Result<Cli, lexopt::Error> {
     let mut input = Vec::new();
     let mut output: Option<OutputTarget> = None;
     let mut concat = false;
-    let mut verbose = false;
+    // Defaults: tools off, timestamps off, model on, agent on, context on
+    let mut show_tools = false;
     let mut show_timestamps = false;
-    let mut no_model = false;
+    let mut show_model = true;
+    let mut show_agent = true;
+    let mut show_context = true;
     let mut heading_offset: u8 = 0;
     let mut quiet = false;
     let mut dry_run = false;
@@ -132,9 +149,17 @@ fn parse_args() -> Result<Cli, lexopt::Error> {
                 });
             }
             Long("concat") => concat = true,
-            Short('v') | Long("verbose") => verbose = true,
+            // Show/hide flags - last one wins
+            Short('v') | Long("verbose" | "show-tools") => show_tools = true,
+            Long("hide-tools") => show_tools = false,
             Long("show-timestamps") => show_timestamps = true,
-            Long("no-model") => no_model = true,
+            Long("hide-timestamps") => show_timestamps = false,
+            Long("show-model") => show_model = true,
+            Long("hide-model" | "no-model") => show_model = false,
+            Long("show-agent") => show_agent = true,
+            Long("hide-agent") => show_agent = false,
+            Long("show-context") => show_context = true,
+            Long("hide-context") => show_context = false,
             Long("heading-offset") => {
                 let val: u8 = parser
                     .value()?
@@ -165,9 +190,11 @@ fn parse_args() -> Result<Cli, lexopt::Error> {
         input,
         output: output.ok_or("missing required option: --output")?,
         concat,
-        verbose,
+        show_tools,
         show_timestamps,
-        no_model,
+        show_model,
+        show_agent,
+        show_context,
         heading_offset,
         quiet,
         dry_run,
@@ -229,9 +256,11 @@ fn collect_input_files(inputs: &[PathBuf]) -> Vec<PathBuf> {
 #[allow(clippy::missing_const_for_fn)]
 fn make_render_options(cli: &Cli) -> renderer::RenderOptions {
     renderer::RenderOptions {
-        show_tools: cli.verbose,
+        show_tools: cli.show_tools,
         show_timestamps: cli.show_timestamps,
-        show_model: !cli.no_model,
+        show_model: cli.show_model,
+        show_agent: cli.show_agent,
+        show_context: cli.show_context,
         heading_offset: cli.heading_offset,
     }
 }
