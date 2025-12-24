@@ -9,6 +9,7 @@
 use cp2md::{parser, renderer};
 use lexopt::prelude::*;
 use snafu::{OptionExt, ensure, prelude::*};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -17,6 +18,8 @@ use walkdir::WalkDir;
 enum OutputTarget {
     /// Write each file to the specified directory.
     Directory(PathBuf),
+    /// Write concatenated output to a single file.
+    File(PathBuf),
     /// Write to stdout.
     Stdout,
 }
@@ -44,6 +47,15 @@ enum Error {
 
     #[snafu(display("heading-offset must be 0-5"))]
     InvalidHeadingOffset,
+
+    #[snafu(display("missing required option: --output"))]
+    MissingOutput,
+
+    #[snafu(display("failed to list inputs under {}: {source}", path.display()))]
+    ListInputs {
+        path: PathBuf,
+        source: walkdir::Error,
+    },
 
     #[snafu(display("at least one input file or directory is required"))]
     NoInputFiles,
@@ -74,6 +86,9 @@ enum Error {
         path: PathBuf,
         source: std::io::Error,
     },
+
+    #[snafu(display("file output requires --concat (got {})", path.display()))]
+    FileOutputRequiresConcat { path: PathBuf },
 }
 
 fn print_help() {
@@ -116,7 +131,7 @@ Other options:
     );
 }
 
-fn parse_args() -> Result<Cli, lexopt::Error> {
+fn parse_args() -> Result<Cli, Error> {
     // Show help if no arguments provided
     if std::env::args().len() == 1 {
         print_help();
@@ -138,10 +153,14 @@ fn parse_args() -> Result<Cli, lexopt::Error> {
     let mut force = false;
 
     let mut parser = lexopt::Parser::from_env();
-    while let Some(arg) = parser.next()? {
+    while let Some(arg) = parser.next().context(ParseArgsSnafu)? {
         match arg {
             Short('o') | Long("output") => {
-                let val: PathBuf = parser.value()?.parse()?;
+                let val: PathBuf = parser
+                    .value()
+                    .context(ParseArgsSnafu)?
+                    .parse()
+                    .context(ParseArgsSnafu)?;
                 output = Some(if val == Path::new("-") {
                     OutputTarget::Stdout
                 } else {
@@ -162,12 +181,11 @@ fn parse_args() -> Result<Cli, lexopt::Error> {
             Long("hide-context") => show_context = false,
             Long("heading-offset") => {
                 let val: u8 = parser
-                    .value()?
+                    .value()
+                    .context(ParseArgsSnafu)?
                     .parse()
-                    .map_err(|_| "heading-offset must be a number 0-5")?;
-                if val > 5 {
-                    return Err("heading-offset must be 0-5".into());
-                }
+                    .context(ParseArgsSnafu)?;
+                ensure!(val <= 5, InvalidHeadingOffsetSnafu);
                 heading_offset = val;
             }
             Short('q') | Long("quiet") => quiet = true,
@@ -181,14 +199,20 @@ fn parse_args() -> Result<Cli, lexopt::Error> {
                 println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
-            Value(val) => input.push(val.parse()?),
-            _ => return Err(arg.unexpected()),
+            Value(val) => input.push(val.parse().context(ParseArgsSnafu)?),
+            _ => return Err(arg.unexpected()).context(ParseArgsSnafu),
         }
     }
 
+    let output = output.context(MissingOutputSnafu)?;
+    let output = match (concat, &output) {
+        (true, OutputTarget::Directory(path)) => OutputTarget::File(path.clone()),
+        _ => output,
+    };
+
     Ok(Cli {
         input,
-        output: output.ok_or("missing required option: --output")?,
+        output,
         concat,
         show_tools,
         show_timestamps,
@@ -203,12 +227,12 @@ fn parse_args() -> Result<Cli, lexopt::Error> {
 }
 
 fn main() -> Result<(), Error> {
-    let cli = parse_args().context(ParseArgsSnafu)?;
+    let cli = parse_args()?;
 
     ensure!(!cli.input.is_empty(), NoInputFilesSnafu);
 
     // Collect all input files first
-    let files = collect_input_files(&cli.input);
+    let files = collect_input_files(&cli.input)?;
 
     if cli.concat {
         process_concat(&files, &cli)?;
@@ -227,6 +251,9 @@ fn main() -> Result<(), Error> {
                     process_file(file, dir, &cli)?;
                 }
             }
+            OutputTarget::File(path) => {
+                return FileOutputRequiresConcatSnafu { path: path.clone() }.fail();
+            }
         }
     }
 
@@ -234,22 +261,35 @@ fn main() -> Result<(), Error> {
 }
 
 /// Collects all JSON files from the given inputs (files and directories).
-fn collect_input_files(inputs: &[PathBuf]) -> Vec<PathBuf> {
+///
+/// Directory traversal is sorted and deduplicated so multi-run output is
+/// deterministic and we never re-render the same file twice. Traversal errors
+/// are surfaced instead of silently skipping entries so the caller can fail
+/// fast when input discovery is incomplete.
+fn collect_input_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
     let mut files = Vec::new();
+    let mut seen = HashSet::new();
+
     for input in inputs {
         if input.is_dir() {
-            for entry in WalkDir::new(input)
-                .into_iter()
-                .filter_map(Result::ok)
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
-            {
-                files.push(entry.path().to_path_buf());
+            for entry in WalkDir::new(input).sort_by_file_name() {
+                let entry = entry.context(ListInputsSnafu {
+                    path: input.clone(),
+                })?;
+
+                if entry.path().extension().is_some_and(|ext| ext == "json") {
+                    let path = entry.into_path();
+                    if seen.insert(path.clone()) {
+                        files.push(path);
+                    }
+                }
             }
-        } else {
+        } else if seen.insert(input.clone()) {
             files.push(input.clone());
         }
     }
-    files
+
+    Ok(files)
 }
 
 /// Creates render options from CLI arguments.
@@ -265,6 +305,12 @@ fn make_render_options(cli: &Cli) -> renderer::RenderOptions {
     }
 }
 
+/// Loads a chat file, ensuring all callers surface consistent error context.
+fn load_chat(path: &Path) -> Result<parser::ChatExport, Error> {
+    let json = std::fs::read_to_string(path).context(ReadFileSnafu { path })?;
+    parser::parse_chat(&json).context(ParseFileSnafu { path })
+}
+
 /// Processes a single file and outputs to stdout.
 fn process_to_stdout(input: &Path, cli: &Cli) -> Result<(), Error> {
     if cli.dry_run {
@@ -272,8 +318,7 @@ fn process_to_stdout(input: &Path, cli: &Cli) -> Result<(), Error> {
         return Ok(());
     }
 
-    let json = std::fs::read_to_string(input).context(ReadFileSnafu { path: input })?;
-    let chat = parser::parse_chat(&json).context(ParseFileSnafu { path: input })?;
+    let chat = load_chat(input)?;
 
     let opts = make_render_options(cli);
     let markdown = renderer::render_chat(&chat, &opts);
@@ -291,8 +336,7 @@ fn process_concat(files: &[PathBuf], cli: &Cli) -> Result<(), Error> {
         if i > 0 {
             output.push_str("\n---\n\n");
         }
-        let json = std::fs::read_to_string(path).context(ReadFileSnafu { path })?;
-        let chat = parser::parse_chat(&json).context(ParseFileSnafu { path })?;
+        let chat = load_chat(path)?;
         output.push_str(&renderer::render_chat(&chat, &opts));
     }
 
@@ -304,7 +348,7 @@ fn process_concat(files: &[PathBuf], cli: &Cli) -> Result<(), Error> {
                 print!("{output}");
             }
         }
-        OutputTarget::Directory(path) => {
+        OutputTarget::File(path) | OutputTarget::Directory(path) => {
             // In concat mode, treat path as a file, not directory
             if cli.dry_run {
                 eprintln!(
@@ -355,8 +399,7 @@ fn process_file(input: &Path, out_dir: &Path, cli: &Cli) -> Result<(), Error> {
         return Ok(());
     }
 
-    let json = std::fs::read_to_string(input).context(ReadFileSnafu { path: input })?;
-    let chat = parser::parse_chat(&json).context(ParseFileSnafu { path: input })?;
+    let chat = load_chat(input)?;
 
     let opts = make_render_options(cli);
     let markdown = renderer::render_chat(&chat, &opts);
@@ -367,4 +410,85 @@ fn process_file(input: &Path, out_dir: &Path, cli: &Cli) -> Result<(), Error> {
         eprintln!("Wrote {}", out_path.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn collects_unique_json_files_in_order() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        let direct = root.join("b.json");
+        fs::write(&direct, "{}\n").unwrap();
+        fs::write(root.join("a.json"), "{}\n").unwrap();
+
+        let nested = root.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("c.json"), "{}\n").unwrap();
+
+        fs::write(root.join("notes.txt"), "irrelevant").unwrap();
+
+        let files = collect_input_files(&[direct.clone(), root.to_path_buf()]).unwrap();
+
+        assert_eq!(
+            files,
+            vec![direct, root.join("a.json"), nested.join("c.json")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn errors_on_inaccessible_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let bad_dir = temp.path().join("restricted");
+        fs::create_dir(&bad_dir).unwrap();
+
+        fs::set_permissions(&bad_dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = collect_input_files(std::slice::from_ref(&bad_dir));
+        assert!(result.is_err());
+
+        // Restore permissions so TempDir cleanup succeeds
+        fs::set_permissions(&bad_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn process_concat_writes_file_output() {
+        let temp = TempDir::new().unwrap();
+
+        let input_path = temp.path().join("chat.json");
+        fs::write(
+            &input_path,
+            r#"{"responderUsername":"GitHub Copilot","requests":[]}"#,
+        )
+        .unwrap();
+
+        let output_path = temp.path().join("out.md");
+
+        let cli = Cli {
+            input: vec![],
+            output: OutputTarget::File(output_path.clone()),
+            concat: true,
+            show_tools: false,
+            show_timestamps: false,
+            show_model: true,
+            show_agent: true,
+            show_context: true,
+            heading_offset: 0,
+            quiet: false,
+            dry_run: false,
+            force: true,
+        };
+
+        process_concat(&[input_path], &cli).unwrap();
+
+        let contents = fs::read_to_string(&output_path).unwrap();
+        assert!(contents.starts_with("# Copilot Chat"));
+    }
 }

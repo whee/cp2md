@@ -18,6 +18,9 @@ serde_json = "1"
 snafu      = "0.8"
 walkdir    = "2"
 
+[dev-dependencies]
+tempfile = "3"
+
 [lints.rust]
 unsafe_code = "forbid"
 

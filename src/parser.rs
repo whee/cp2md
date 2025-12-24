@@ -298,7 +298,8 @@ fn extract_context(value: &serde_json::Value) -> Vec<ContextItem> {
                     let end_line = range
                         .get("endLineNumber")
                         .and_then(serde_json::Value::as_u64)
-                        .unwrap_or_else(|| u64::from(start_line)) as u32;
+                        .unwrap_or_else(|| u64::from(start_line))
+                        as u32;
 
                     // Only treat as selection if it's actually a selection (not whole file)
                     if id.contains("selection") || start_line != end_line || start_line > 1 {
