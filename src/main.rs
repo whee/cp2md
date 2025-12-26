@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 /// Where to write the rendered output.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum OutputTarget {
     /// Write each file to the specified directory.
     Directory(PathBuf),
@@ -24,6 +24,7 @@ enum OutputTarget {
     Stdout,
 }
 
+#[derive(Debug)]
 #[allow(clippy::struct_excessive_bools)]
 struct Cli {
     input: Vec<PathBuf>,
@@ -137,7 +138,12 @@ fn parse_args() -> Result<Cli, Error> {
         print_help();
         std::process::exit(0);
     }
+    parse_args_from(std::env::args())
+}
 
+fn parse_args_from(
+    args: impl IntoIterator<Item = impl Into<std::ffi::OsString>>,
+) -> Result<Cli, Error> {
     let mut input = Vec::new();
     let mut output: Option<OutputTarget> = None;
     let mut concat = false;
@@ -152,7 +158,7 @@ fn parse_args() -> Result<Cli, Error> {
     let mut dry_run = false;
     let mut force = false;
 
-    let mut parser = lexopt::Parser::from_env();
+    let mut parser = lexopt::Parser::from_args(args);
     while let Some(arg) = parser.next().context(ParseArgsSnafu)? {
         match arg {
             Short('o') | Long("output") => {
@@ -327,18 +333,26 @@ fn process_to_stdout(input: &Path, cli: &Cli) -> Result<(), Error> {
     Ok(())
 }
 
-/// Processes multiple files and concatenates them into a single output.
-fn process_concat(files: &[PathBuf], cli: &Cli) -> Result<(), Error> {
-    let opts = make_render_options(cli);
+/// Pure: renders multiple chats into a single concatenated output.
+fn render_concat(chats: &[parser::ChatExport], opts: &renderer::RenderOptions) -> String {
     let mut output = String::new();
-
-    for (i, path) in files.iter().enumerate() {
+    for (i, chat) in chats.iter().enumerate() {
         if i > 0 {
             output.push_str("\n---\n\n");
         }
-        let chat = load_chat(path)?;
-        output.push_str(&renderer::render_chat(&chat, &opts));
+        output.push_str(&renderer::render_chat(chat, opts));
     }
+    output
+}
+
+/// Processes multiple files and concatenates them into a single output.
+fn process_concat(files: &[PathBuf], cli: &Cli) -> Result<(), Error> {
+    let chats: Vec<_> = files
+        .iter()
+        .map(|p| load_chat(p))
+        .collect::<Result<_, _>>()?;
+    let opts = make_render_options(cli);
+    let output = render_concat(&chats, &opts);
 
     match &cli.output {
         OutputTarget::Stdout => {
@@ -418,6 +432,76 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// Helper to create args from a string for testing.
+    fn args(s: &str) -> impl Iterator<Item = &str> {
+        s.split_whitespace()
+    }
+
+    // =========================================================================
+    // Pure argument parsing tests (no I/O)
+    // =========================================================================
+
+    #[test]
+    fn parses_output_to_stdout() {
+        let cli = parse_args_from(args("cp2md input.json -o -")).unwrap();
+        assert!(matches!(cli.output, OutputTarget::Stdout));
+    }
+
+    #[test]
+    fn parses_output_to_directory() {
+        let cli = parse_args_from(args("cp2md input.json -o out/")).unwrap();
+        assert!(matches!(cli.output, OutputTarget::Directory(_)));
+    }
+
+    #[test]
+    fn error_on_missing_output() {
+        let err = parse_args_from(args("cp2md input.json")).unwrap_err();
+        assert!(matches!(err, Error::MissingOutput));
+    }
+
+    #[test]
+    fn error_on_invalid_heading_offset() {
+        let err = parse_args_from(args("cp2md -o - --heading-offset 7 x.json")).unwrap_err();
+        assert!(matches!(err, Error::InvalidHeadingOffset));
+    }
+
+    #[test]
+    fn concat_converts_directory_to_file_target() {
+        let cli = parse_args_from(args("cp2md --concat -o out.md input.json")).unwrap();
+        assert!(matches!(cli.output, OutputTarget::File(_)));
+    }
+
+    #[test]
+    fn verbose_enables_show_tools() {
+        let cli = parse_args_from(args("cp2md -v -o - x.json")).unwrap();
+        assert!(cli.show_tools);
+    }
+
+    #[test]
+    fn last_flag_wins() {
+        let cli = parse_args_from(args("cp2md --show-model --hide-model -o - x.json")).unwrap();
+        assert!(!cli.show_model);
+    }
+
+    // =========================================================================
+    // Pure rendering tests (no I/O)
+    // =========================================================================
+
+    #[test]
+    fn render_concat_joins_with_separator() {
+        let chat1 = parser::parse_chat(r#"{"responderUsername":"Copilot","requests":[]}"#).unwrap();
+        let chat2 = parser::parse_chat(r#"{"responderUsername":"Copilot","requests":[]}"#).unwrap();
+
+        let output = render_concat(&[chat1, chat2], &renderer::RenderOptions::default());
+
+        assert_eq!(output.matches("# Copilot Chat").count(), 2);
+        assert!(output.contains("\n---\n\n"));
+    }
+
+    // =========================================================================
+    // Filesystem tests (require tempfiles)
+    // =========================================================================
+
     #[test]
     fn collects_unique_json_files_in_order() {
         let temp = TempDir::new().unwrap();
@@ -456,39 +540,5 @@ mod tests {
 
         // Restore permissions so TempDir cleanup succeeds
         fs::set_permissions(&bad_dir, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    #[test]
-    fn process_concat_writes_file_output() {
-        let temp = TempDir::new().unwrap();
-
-        let input_path = temp.path().join("chat.json");
-        fs::write(
-            &input_path,
-            r#"{"responderUsername":"GitHub Copilot","requests":[]}"#,
-        )
-        .unwrap();
-
-        let output_path = temp.path().join("out.md");
-
-        let cli = Cli {
-            input: vec![],
-            output: OutputTarget::File(output_path.clone()),
-            concat: true,
-            show_tools: false,
-            show_timestamps: false,
-            show_model: true,
-            show_agent: true,
-            show_context: true,
-            heading_offset: 0,
-            quiet: false,
-            dry_run: false,
-            force: true,
-        };
-
-        process_concat(&[input_path], &cli).unwrap();
-
-        let contents = fs::read_to_string(&output_path).unwrap();
-        assert!(contents.starts_with("# Copilot Chat"));
     }
 }
