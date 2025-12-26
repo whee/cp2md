@@ -7,8 +7,9 @@ Convert GitHub Copilot chat exports to Markdown.
 ## Highlights
 
 - Converts GitHub Copilot chat exports (single files or whole directories) to Markdown
+- Shows model, agent, and attached context by default
 - Optional inclusion of tool invocations and timestamps
-- CLI-friendly: `cp2md [OPTIONS] --output <OUTPUT> <INPUT>...`
+- CLI-friendly: `cp2md [OPTIONS] -o <OUTPUT> <INPUT>...`
 
 ## Installation
 
@@ -22,21 +23,35 @@ cargo build --release
 ## Usage
 
 ```bash
-cp2md [OPTIONS] --output <OUTPUT> <INPUT>...
+cp2md [OPTIONS] -o <OUTPUT> <INPUT>...
 ```
 
 ### Arguments
 
-- `<INPUT>...` - One or more JSON files or directories containing Copilot chat exports
+- `<INPUT>...` - Input JSON files or directories containing exports
 
 ### Options
 
-- `-o, --output <OUTPUT>` - Output directory (or file with `--concat`, or `-` for stdout) (required)
-- `--concat` - Combine all inputs into a single output file
-- `-v, --verbose` - Include tool invocations in output
-- `--show-timestamps` - Include timestamps in conversation metadata
-- `--no-model` - Hide model ID from output
+- `-o, --output <OUTPUT>` - Output directory (or file with `--concat`, or `-` for stdout)
+- `--concat` - Combine all inputs into a single output
 - `--heading-offset <N>` - Shift heading levels by N (0-5, default: 0)
+
+### Metadata Display
+
+Use `--show-*` or `--hide-*` flags to control what appears in output:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--show-timestamps` / `--hide-timestamps` | off | Timestamps for each message |
+| `--show-model` / `--hide-model` | on | Model identifier (e.g., `claude-sonnet-4`) |
+| `--show-agent` / `--hide-agent` | on | VS Code agent name (e.g., `@workspace`) |
+| `--show-context` / `--hide-context` | on | Attached files and selections |
+| `--show-tools` / `--hide-tools` | off | Tool invocations (searches, reads) |
+
+`-v, --verbose` is an alias for `--show-tools`.
+
+### Other Options
+
 - `-q, --quiet` - Suppress progress messages
 - `-n, --dry-run` - Show what would be processed without writing
 - `-f, --force` - Overwrite existing output files
@@ -61,6 +76,12 @@ Include tool invocations (searches, file reads, etc.):
 
 ```bash
 cp2md chat.json -o output/ --verbose
+```
+
+Minimal output (just messages):
+
+```bash
+cp2md chat.json -o - --hide-model --hide-agent --hide-context
 ```
 
 Preview what would be converted without writing:
@@ -89,11 +110,14 @@ Export chat history using the VS Code command palette: `Copilot: Export Chat...`
 
 Each input file `foo.json` produces `foo.md` in the output directory. The Markdown includes:
 
-- Model identifier for each user message
-- Timestamps (with `--show-timestamps`)
+- Model identifier and agent name in metadata line
+- Attached context in a collapsible details block (files, selections, folders, instruction files)
 - User prompts and assistant responses
+- Timestamps (with `--show-timestamps`)
 - Tool invocations (with `--verbose`)
 - File modification summaries
+
+Headings in user/assistant content are shifted down to prevent them from disrupting document structure. XML-like tags are escaped to render literally.
 
 Example output:
 
@@ -102,7 +126,15 @@ Example output:
 
 ## User
 
-*claude-sonnet-4*
+*claude-sonnet-4 · @workspace*
+
+<details>
+<summary>📎 Context</summary>
+
+- `main.rs` (file)
+- `lib.rs`:10-25 (selection)
+
+</details>
 
 How do I reverse a string in Python?
 
