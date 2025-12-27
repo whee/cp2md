@@ -35,6 +35,7 @@ struct Cli {
     show_model: bool,
     show_agent: bool,
     show_context: bool,
+    show_edits: bool,
     heading_offset: u8,
     quiet: bool,
     dry_run: bool,
@@ -119,7 +120,10 @@ Metadata display (use --show-* or --hide-*):
       --hide-context        Hide attached context
       --show-tools          Include tool invocations (default: off)
       --hide-tools          Hide tool invocations
+      --show-edits          Include full code for file edits (default: off)
+      --hide-edits          Hide full code for file edits
   -v, --verbose             Alias for --show-tools
+      --compact             Hide all metadata (model, agent, context, tools, timestamps)
 
 Other options:
   -q, --quiet               Suppress progress messages
@@ -147,12 +151,13 @@ fn parse_args_from(
     let mut input = Vec::new();
     let mut output: Option<OutputTarget> = None;
     let mut concat = false;
-    // Defaults: tools off, timestamps off, model on, agent on, context on
+    // Defaults: tools off, timestamps off, edits off, model on, agent on, context on
     let mut show_tools = false;
     let mut show_timestamps = false;
     let mut show_model = true;
     let mut show_agent = true;
     let mut show_context = true;
+    let mut show_edits = false;
     let mut heading_offset: u8 = 0;
     let mut quiet = false;
     let mut dry_run = false;
@@ -185,6 +190,15 @@ fn parse_args_from(
             Long("hide-agent") => show_agent = false,
             Long("show-context") => show_context = true,
             Long("hide-context") => show_context = false,
+            Long("show-edits") => show_edits = true,
+            Long("hide-edits") => show_edits = false,
+            Long("compact") => {
+                show_model = false;
+                show_agent = false;
+                show_context = false;
+                show_tools = false;
+                show_timestamps = false;
+            }
             Long("heading-offset") => {
                 let val: u8 = parser
                     .value()
@@ -225,6 +239,7 @@ fn parse_args_from(
         show_model,
         show_agent,
         show_context,
+        show_edits,
         heading_offset,
         quiet,
         dry_run,
@@ -307,6 +322,7 @@ fn make_render_options(cli: &Cli) -> renderer::RenderOptions {
         show_model: cli.show_model,
         show_agent: cli.show_agent,
         show_context: cli.show_context,
+        show_edits: cli.show_edits,
         heading_offset: cli.heading_offset,
     }
 }
@@ -481,6 +497,38 @@ mod tests {
     fn last_flag_wins() {
         let cli = parse_args_from(args("cp2md --show-model --hide-model -o - x.json")).unwrap();
         assert!(!cli.show_model);
+    }
+
+    #[test]
+    fn show_edits_flag_parsed() {
+        let cli = parse_args_from(args("cp2md --show-edits -o - x.json")).unwrap();
+        assert!(cli.show_edits);
+    }
+
+    #[test]
+    fn compact_disables_all_metadata() {
+        let cli = parse_args_from(args("cp2md --compact -o - x.json")).unwrap();
+        assert!(!cli.show_model);
+        assert!(!cli.show_agent);
+        assert!(!cli.show_context);
+        assert!(!cli.show_tools);
+        assert!(!cli.show_timestamps);
+        // show_edits is not affected by compact
+        assert!(!cli.show_edits);
+    }
+
+    #[test]
+    fn compact_can_be_overridden() {
+        let cli = parse_args_from(args(
+            "cp2md --compact --show-model --show-edits -o - x.json",
+        ))
+        .unwrap();
+        // Last flag wins: show-model after compact re-enables it
+        assert!(cli.show_model);
+        assert!(cli.show_edits);
+        // These remain disabled from compact
+        assert!(!cli.show_agent);
+        assert!(!cli.show_context);
     }
 
     // =========================================================================

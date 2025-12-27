@@ -80,6 +80,12 @@ pub struct RenderOptions {
     /// attached to each request in a collapsible details block.
     pub show_context: bool,
 
+    /// Whether to include the actual code content of file edits.
+    ///
+    /// When enabled, `TextEditGroup` elements show the full code in a fenced
+    /// block after the summary line. Default is off (summary only).
+    pub show_edits: bool,
+
     /// Number of heading levels to shift (0-5).
     ///
     /// A value of 0 produces H1/H2 headings (default).
@@ -95,6 +101,7 @@ impl Default for RenderOptions {
             show_model: true,
             show_agent: true,
             show_context: true,
+            show_edits: false,
             heading_offset: 0,
         }
     }
@@ -303,6 +310,18 @@ fn render_response(out: &mut String, elements: &[ResponseElement], opts: &Render
                     escape_for_inline_code(filename)
                 )
                 .unwrap();
+
+                if opts.show_edits {
+                    let lang = extension_to_language(path);
+                    writeln!(out, "```{lang}").unwrap();
+                    for (i, edit) in edits.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str("\n// ...\n\n");
+                        }
+                        out.push_str(edit);
+                    }
+                    writeln!(out, "\n```\n").unwrap();
+                }
             }
             _ => {}
         }
@@ -327,6 +346,43 @@ fn is_only_code_fences(s: &str) -> bool {
 /// syntax when displaying filenames that contain backticks.
 fn escape_for_inline_code(s: &str) -> String {
     s.replace('`', "'")
+}
+
+/// Maps file extensions to markdown language identifiers for syntax highlighting.
+fn extension_to_language(path: &str) -> &'static str {
+    match Path::new(path).extension().and_then(|e| e.to_str()) {
+        Some("rs") => "rust",
+        Some("py") => "python",
+        Some("js") => "javascript",
+        Some("ts") => "typescript",
+        Some("jsx") => "jsx",
+        Some("tsx") => "tsx",
+        Some("go") => "go",
+        Some("rb") => "ruby",
+        Some("java") => "java",
+        Some("kt" | "kts") => "kotlin",
+        Some("swift") => "swift",
+        Some("c" | "h") => "c",
+        Some("cpp" | "cc" | "cxx" | "hpp") => "cpp",
+        Some("cs") => "csharp",
+        Some("sh" | "bash") => "bash",
+        Some("zsh") => "zsh",
+        Some("fish") => "fish",
+        Some("ps1") => "powershell",
+        Some("json") => "json",
+        Some("yaml" | "yml") => "yaml",
+        Some("toml") => "toml",
+        Some("xml") => "xml",
+        Some("md" | "markdown") => "markdown",
+        Some("html" | "htm") => "html",
+        Some("css") => "css",
+        Some("scss") => "scss",
+        Some("sql") => "sql",
+        Some("graphql" | "gql") => "graphql",
+        Some("dockerfile") => "dockerfile",
+        Some("makefile") => "makefile",
+        _ => "",
+    }
 }
 
 /// Shifts Markdown heading levels down by a specified amount.
@@ -937,5 +993,80 @@ mod tests {
         assert!(output.contains("#### Top heading"));
         // Our structure uses offset
         assert!(output.contains("### User"));
+    }
+
+    // Tests for show_edits option
+    #[test]
+    fn hides_edit_code_by_default() {
+        let chat = make_chat(vec![make_request(
+            "Edit",
+            vec![ResponseElement::TextEditGroup {
+                path: "/src/main.rs".into(),
+                edits: vec!["fn main() {}".into()],
+            }],
+        )]);
+        let output = render_chat(&chat, &default_opts());
+
+        assert!(output.contains("*Modified `main.rs`"));
+        assert!(!output.contains("fn main()"));
+    }
+
+    #[test]
+    fn renders_text_edit_with_code_when_show_edits_enabled() {
+        let chat = make_chat(vec![make_request(
+            "Edit",
+            vec![ResponseElement::TextEditGroup {
+                path: "/src/main.rs".into(),
+                edits: vec!["fn main() {\n    println!(\"hello\");\n}".into()],
+            }],
+        )]);
+        let opts = RenderOptions {
+            show_edits: true,
+            ..Default::default()
+        };
+        let output = render_chat(&chat, &opts);
+
+        assert!(output.contains("*Modified `main.rs`"));
+        assert!(output.contains("```rust"));
+        assert!(output.contains("fn main()"));
+        assert!(output.contains("println!"));
+    }
+
+    #[test]
+    fn renders_multiple_edits_with_separator() {
+        let chat = make_chat(vec![make_request(
+            "Edit",
+            vec![ResponseElement::TextEditGroup {
+                path: "/src/lib.rs".into(),
+                edits: vec!["fn first() {}".into(), "fn second() {}".into()],
+            }],
+        )]);
+        let opts = RenderOptions {
+            show_edits: true,
+            ..Default::default()
+        };
+        let output = render_chat(&chat, &opts);
+
+        assert!(output.contains("fn first()"));
+        assert!(output.contains("// ..."));
+        assert!(output.contains("fn second()"));
+    }
+
+    // Tests for extension_to_language helper
+    #[test]
+    fn extension_to_language_common_extensions() {
+        assert_eq!(extension_to_language("/src/main.rs"), "rust");
+        assert_eq!(extension_to_language("/app/server.py"), "python");
+        assert_eq!(extension_to_language("/lib/utils.js"), "javascript");
+        assert_eq!(extension_to_language("/src/app.ts"), "typescript");
+        assert_eq!(extension_to_language("/cmd/main.go"), "go");
+        assert_eq!(extension_to_language("/config.json"), "json");
+        assert_eq!(extension_to_language("/styles.css"), "css");
+    }
+
+    #[test]
+    fn extension_to_language_unknown_returns_empty() {
+        assert_eq!(extension_to_language("/file.xyz"), "");
+        assert_eq!(extension_to_language("/no_extension"), "");
     }
 }
