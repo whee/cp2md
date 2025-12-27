@@ -351,34 +351,69 @@ fn escape_for_inline_code(s: &str) -> String {
 /// Maps file extensions to markdown language identifiers for syntax highlighting.
 fn extension_to_language(path: &str) -> &'static str {
     match Path::new(path).extension().and_then(|e| e.to_str()) {
+        // Systems languages
         Some("rs") => "rust",
+        Some("c" | "h") => "c",
+        Some("cpp" | "cc" | "cxx" | "hpp") => "cpp",
+        Some("go") => "go",
+        Some("zig") => "zig",
+        // JVM languages
+        Some("java") => "java",
+        Some("kt" | "kts") => "kotlin",
+        Some("scala" | "sc") => "scala",
+        Some("clj" | "cljs" | "cljc") => "clojure",
+        // .NET languages
+        Some("cs") => "csharp",
+        Some("fs" | "fsx") => "fsharp",
+        // Dynamic/scripting languages
         Some("py") => "python",
+        Some("rb") => "ruby",
+        Some("php") => "php",
+        Some("pl" | "pm") => "perl",
+        Some("lua") => "lua",
+        Some("r" | "R") => "r",
+        // Functional languages
+        Some("hs" | "lhs") => "haskell",
+        Some("ml" | "mli") => "ocaml",
+        Some("ex" | "exs") => "elixir",
+        Some("erl" | "hrl") => "erlang",
+        Some("nim") => "nim",
+        // Web frontend
         Some("js") => "javascript",
         Some("ts") => "typescript",
         Some("jsx") => "jsx",
         Some("tsx") => "tsx",
-        Some("go") => "go",
-        Some("rb") => "ruby",
-        Some("java") => "java",
-        Some("kt" | "kts") => "kotlin",
+        Some("vue") => "vue",
+        Some("svelte") => "svelte",
+        // Apple/mobile
         Some("swift") => "swift",
-        Some("c" | "h") => "c",
-        Some("cpp" | "cc" | "cxx" | "hpp") => "cpp",
-        Some("cs") => "csharp",
-        Some("sh" | "bash") => "bash",
+        Some("m" | "mm") => "objectivec",
+        Some("dart") => "dart",
+        // Shell
+        Some("sh") => "shell",
+        Some("bash") => "bash",
         Some("zsh") => "zsh",
         Some("fish") => "fish",
         Some("ps1") => "powershell",
+        // Data/config formats
         Some("json") => "json",
         Some("yaml" | "yml") => "yaml",
         Some("toml") => "toml",
         Some("xml") => "xml",
+        Some("proto") => "protobuf",
+        Some("tf" | "hcl") => "hcl",
+        // Markup/docs
         Some("md" | "markdown") => "markdown",
         Some("html" | "htm") => "html",
+        // Stylesheets
         Some("css") => "css",
         Some("scss") => "scss",
+        Some("less") => "less",
+        // Query languages
         Some("sql") => "sql",
         Some("graphql" | "gql") => "graphql",
+        // Other
+        Some("diff" | "patch") => "diff",
         Some("dockerfile") => "dockerfile",
         Some("makefile") => "makefile",
         _ => "",
@@ -1055,13 +1090,42 @@ mod tests {
     // Tests for extension_to_language helper
     #[test]
     fn extension_to_language_common_extensions() {
+        // Systems
         assert_eq!(extension_to_language("/src/main.rs"), "rust");
+        assert_eq!(extension_to_language("/cmd/main.go"), "go");
+        assert_eq!(extension_to_language("/src/main.zig"), "zig");
+        // JVM
+        assert_eq!(extension_to_language("/App.java"), "java");
+        assert_eq!(extension_to_language("/App.scala"), "scala");
+        assert_eq!(extension_to_language("/core.clj"), "clojure");
+        // Dynamic
         assert_eq!(extension_to_language("/app/server.py"), "python");
+        assert_eq!(extension_to_language("/index.php"), "php");
+        assert_eq!(extension_to_language("/script.lua"), "lua");
+        assert_eq!(extension_to_language("/analysis.r"), "r");
+        // Functional
+        assert_eq!(extension_to_language("/Main.hs"), "haskell");
+        assert_eq!(extension_to_language("/app.ex"), "elixir");
+        // Web
         assert_eq!(extension_to_language("/lib/utils.js"), "javascript");
         assert_eq!(extension_to_language("/src/app.ts"), "typescript");
-        assert_eq!(extension_to_language("/cmd/main.go"), "go");
+        assert_eq!(extension_to_language("/App.vue"), "vue");
+        assert_eq!(extension_to_language("/App.svelte"), "svelte");
+        // Mobile
+        assert_eq!(extension_to_language("/ViewController.m"), "objectivec");
+        assert_eq!(extension_to_language("/main.dart"), "dart");
+        // Shell
+        assert_eq!(extension_to_language("/script.sh"), "shell");
+        assert_eq!(extension_to_language("/script.bash"), "bash");
+        // Config
         assert_eq!(extension_to_language("/config.json"), "json");
+        assert_eq!(extension_to_language("/main.tf"), "hcl");
+        assert_eq!(extension_to_language("/schema.proto"), "protobuf");
+        // Styles
         assert_eq!(extension_to_language("/styles.css"), "css");
+        assert_eq!(extension_to_language("/styles.less"), "less");
+        // Other
+        assert_eq!(extension_to_language("/changes.diff"), "diff");
     }
 
     #[test]
