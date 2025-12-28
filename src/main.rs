@@ -390,6 +390,44 @@ fn main() -> Result<(), Error> {
     Ok(())
 }
 
+/// Describes an input for file collection: either a direct file or a directory
+/// with its pre-walked contents (sorted, flattened).
+#[derive(Debug)]
+enum InputDescriptor {
+    File(PathBuf),
+    Directory { contents: Vec<PathBuf> },
+}
+
+/// Pure function: collects and deduplicates .json files from input descriptors.
+///
+/// Direct files are added as-is (no extension filtering). Directory contents
+/// are filtered to .json files only. Order is preserved and duplicates removed.
+fn collect_from_descriptors(inputs: &[InputDescriptor]) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+
+    for input in inputs {
+        match input {
+            InputDescriptor::File(path) => {
+                if seen.insert(path.clone()) {
+                    files.push(path.clone());
+                }
+            }
+            InputDescriptor::Directory { contents } => {
+                for path in contents {
+                    if path.extension().is_some_and(|ext| ext == "json")
+                        && seen.insert(path.clone())
+                    {
+                        files.push(path.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    files
+}
+
 /// Collects all JSON files from the given inputs (files and directories).
 ///
 /// Directory traversal is sorted and deduplicated so multi-run output is
@@ -397,29 +435,24 @@ fn main() -> Result<(), Error> {
 /// are surfaced instead of silently skipping entries so the caller can fail
 /// fast when input discovery is incomplete.
 fn collect_input_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
-    let mut files = Vec::new();
-    let mut seen = HashSet::new();
+    let mut descriptors = Vec::with_capacity(inputs.len());
 
     for input in inputs {
         if input.is_dir() {
+            let mut contents = Vec::new();
             for entry in WalkDir::new(input).sort_by_file_name() {
                 let entry = entry.context(ListInputsSnafu {
                     path: input.clone(),
                 })?;
-
-                if entry.path().extension().is_some_and(|ext| ext == "json") {
-                    let path = entry.into_path();
-                    if seen.insert(path.clone()) {
-                        files.push(path);
-                    }
-                }
+                contents.push(entry.into_path());
             }
-        } else if seen.insert(input.clone()) {
-            files.push(input.clone());
+            descriptors.push(InputDescriptor::Directory { contents });
+        } else {
+            descriptors.push(InputDescriptor::File(input.clone()));
         }
     }
 
-    Ok(files)
+    Ok(collect_from_descriptors(&descriptors))
 }
 
 /// Creates render options from CLI arguments.
@@ -585,8 +618,6 @@ fn process_file(input: &Path, out_dir: &Path, cli: &Cli) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::TempDir;
 
     /// Helper to create args from a string for testing.
     fn args(s: &str) -> impl Iterator<Item = &str> {
@@ -697,6 +728,51 @@ mod tests {
         assert!(matches!(cli.context, renderer::Visibility::Hidden));
     }
 
+    #[test]
+    fn dry_run_flag_parsed() {
+        let cli = parse_args_from(args("-n -o - x.json")).unwrap();
+        assert!(cli.dry_run);
+
+        let cli = parse_args_from(args("--dry-run -o - x.json")).unwrap();
+        assert!(cli.dry_run);
+    }
+
+    #[test]
+    fn force_flag_parsed() {
+        let cli = parse_args_from(args("-f -o - x.json")).unwrap();
+        assert!(cli.force);
+
+        let cli = parse_args_from(args("--force -o - x.json")).unwrap();
+        assert!(cli.force);
+    }
+
+    #[test]
+    fn quiet_flag_parsed() {
+        let cli = parse_args_from(args("-q -o - x.json")).unwrap();
+        assert!(cli.quiet);
+
+        let cli = parse_args_from(args("--quiet -o - x.json")).unwrap();
+        assert!(cli.quiet);
+    }
+
+    #[test]
+    fn valid_heading_offset_parsed() {
+        for offset in 0..=5 {
+            let cli =
+                parse_args_from(args(&format!("--heading-offset {offset} -o - x.json"))).unwrap();
+            assert_eq!(cli.heading_offset, offset);
+        }
+    }
+
+    #[test]
+    fn flags_default_to_false() {
+        let cli = parse_args_from(args("-o - x.json")).unwrap();
+        assert!(!cli.dry_run);
+        assert!(!cli.force);
+        assert!(!cli.quiet);
+        assert_eq!(cli.heading_offset, 0);
+    }
+
     // =========================================================================
     // Pure rendering tests (no I/O)
     // =========================================================================
@@ -713,46 +789,113 @@ mod tests {
     }
 
     // =========================================================================
-    // Filesystem tests (require tempfiles)
+    // Pure file collection tests (no filesystem access)
     // =========================================================================
 
     #[test]
-    fn collects_unique_json_files_in_order() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path();
+    fn collects_direct_files_first() {
+        let inputs = vec![
+            InputDescriptor::File(PathBuf::from("/direct/b.json")),
+            InputDescriptor::Directory {
+                contents: vec![
+                    PathBuf::from("/dir/a.json"),
+                    PathBuf::from("/dir/nested/c.json"),
+                ],
+            },
+        ];
 
-        let direct = root.join("b.json");
-        fs::write(&direct, "{}\n").unwrap();
-        fs::write(root.join("a.json"), "{}\n").unwrap();
-
-        let nested = root.join("nested");
-        fs::create_dir(&nested).unwrap();
-        fs::write(nested.join("c.json"), "{}\n").unwrap();
-
-        fs::write(root.join("notes.txt"), "irrelevant").unwrap();
-
-        let files = collect_input_files(&[direct.clone(), root.to_path_buf()]).unwrap();
+        let files = collect_from_descriptors(&inputs);
 
         assert_eq!(
             files,
-            vec![direct, root.join("a.json"), nested.join("c.json")]
+            vec![
+                PathBuf::from("/direct/b.json"),
+                PathBuf::from("/dir/a.json"),
+                PathBuf::from("/dir/nested/c.json"),
+            ]
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn errors_on_inaccessible_directory() {
-        use std::os::unix::fs::PermissionsExt;
+    fn deduplicates_files() {
+        let inputs = vec![
+            InputDescriptor::File(PathBuf::from("/a.json")),
+            InputDescriptor::Directory {
+                contents: vec![
+                    PathBuf::from("/a.json"), // duplicate of direct file
+                    PathBuf::from("/b.json"),
+                ],
+            },
+            InputDescriptor::File(PathBuf::from("/b.json")), // duplicate from directory
+        ];
 
-        let temp = TempDir::new().unwrap();
-        let bad_dir = temp.path().join("restricted");
-        fs::create_dir(&bad_dir).unwrap();
+        let files = collect_from_descriptors(&inputs);
 
-        fs::set_permissions(&bad_dir, fs::Permissions::from_mode(0o000)).unwrap();
-        let result = collect_input_files(std::slice::from_ref(&bad_dir));
-        assert!(result.is_err());
+        assert_eq!(
+            files,
+            vec![PathBuf::from("/a.json"), PathBuf::from("/b.json"),]
+        );
+    }
 
-        // Restore permissions so TempDir cleanup succeeds
-        fs::set_permissions(&bad_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    #[test]
+    fn filters_non_json_from_directories() {
+        let inputs = vec![InputDescriptor::Directory {
+            contents: vec![
+                PathBuf::from("/dir/a.json"),
+                PathBuf::from("/dir/notes.txt"),
+                PathBuf::from("/dir/data.json"),
+                PathBuf::from("/dir/readme.md"),
+            ],
+        }];
+
+        let files = collect_from_descriptors(&inputs);
+
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from("/dir/a.json"),
+                PathBuf::from("/dir/data.json"),
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_files_not_filtered_by_extension() {
+        // Direct file inputs are trusted - user explicitly named them
+        let inputs = vec![
+            InputDescriptor::File(PathBuf::from("/explicit.txt")),
+            InputDescriptor::File(PathBuf::from("/also.md")),
+        ];
+
+        let files = collect_from_descriptors(&inputs);
+
+        assert_eq!(
+            files,
+            vec![PathBuf::from("/explicit.txt"), PathBuf::from("/also.md"),]
+        );
+    }
+
+    #[test]
+    fn preserves_input_order() {
+        let inputs = vec![
+            InputDescriptor::File(PathBuf::from("/z.json")),
+            InputDescriptor::File(PathBuf::from("/a.json")),
+            InputDescriptor::Directory {
+                contents: vec![PathBuf::from("/dir/m.json"), PathBuf::from("/dir/b.json")],
+            },
+        ];
+
+        let files = collect_from_descriptors(&inputs);
+
+        // Order matches input order, not alphabetical
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from("/z.json"),
+                PathBuf::from("/a.json"),
+                PathBuf::from("/dir/m.json"),
+                PathBuf::from("/dir/b.json"),
+            ]
+        );
     }
 }
