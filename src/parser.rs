@@ -41,7 +41,7 @@ use snafu::prelude::*;
 #[derive(Debug, Snafu)]
 pub enum ParseError {
     /// Failed to parse JSON content.
-    #[snafu(display("failed to parse JSON: {source}"))]
+    #[snafu(display("invalid JSON"))]
     Json {
         /// The underlying JSON parsing error.
         source: serde_json::Error,

@@ -47,7 +47,7 @@ struct Cli {
 
 #[derive(Debug, Snafu)]
 enum Error {
-    #[snafu(display("failed to parse arguments: {source}"))]
+    #[snafu(display("failed to parse arguments"))]
     ParseArgs { source: lexopt::Error },
 
     #[snafu(display("heading-offset must be 0-5"))]
@@ -66,7 +66,7 @@ enum Error {
     #[snafu(display("missing required option: --output"))]
     MissingOutput,
 
-    #[snafu(display("failed to list inputs under {}: {source}", path.display()))]
+    #[snafu(display("failed to list inputs under {}", path.display()))]
     ListInputs {
         path: PathBuf,
         source: walkdir::Error,
@@ -78,16 +78,19 @@ enum Error {
     #[snafu(display("cannot output multiple files to stdout without --concat"))]
     MultipleFilesToStdout,
 
-    #[snafu(display("failed to create output directory: {source}"))]
-    CreateOutputDir { source: std::io::Error },
+    #[snafu(display("failed to create output directory {}", path.display()))]
+    CreateOutputDir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 
-    #[snafu(display("failed to read {}: {source}", path.display()))]
+    #[snafu(display("failed to read {}", path.display()))]
     ReadFile {
         path: PathBuf,
         source: std::io::Error,
     },
 
-    #[snafu(display("failed to parse {}: {source}", path.display()))]
+    #[snafu(display("failed to parse {}", path.display()))]
     ParseFile {
         path: PathBuf,
         source: parser::ParseError,
@@ -96,7 +99,7 @@ enum Error {
     #[snafu(display("invalid input filename: no file stem"))]
     InvalidFilename,
 
-    #[snafu(display("failed to write {}: {source}", path.display()))]
+    #[snafu(display("failed to write {}", path.display()))]
     WriteFile {
         path: PathBuf,
         source: std::io::Error,
@@ -356,6 +359,7 @@ fn parse_args_from(
     })
 }
 
+#[snafu::report]
 fn main() -> Result<(), Error> {
     let cli = parse_args()?;
 
@@ -375,7 +379,7 @@ fn main() -> Result<(), Error> {
             }
             OutputTarget::Directory(dir) => {
                 if !cli.dry_run {
-                    fs::create_dir_all(dir).context(CreateOutputDirSnafu)?;
+                    fs::create_dir_all(dir).context(CreateOutputDirSnafu { path: dir })?;
                 }
                 for file in &files {
                     process_file(file, dir, &cli)?;
@@ -533,7 +537,7 @@ fn apply_output_plan(plan: OutputPlan, cli: &Cli) -> Result<(), Error> {
             if let Some(parent) = path.parent()
                 && !parent.as_os_str().is_empty()
             {
-                fs::create_dir_all(parent).context(CreateOutputDirSnafu)?;
+                fs::create_dir_all(parent).context(CreateOutputDirSnafu { path: parent })?;
             }
 
             fs::write(&path, &plan.content).context(WriteFileSnafu { path: &path })?;
