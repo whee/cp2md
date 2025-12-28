@@ -53,10 +53,23 @@ Use `--show-*` or `--hide-*` flags to control what appears in output:
 | `--show-agent` / `--hide-agent` | on | VS Code agent name (e.g., `@workspace`) |
 | `--show-context` / `--hide-context` | on | Attached files, selections, folders, and instruction files |
 | `--show-tools` / `--hide-tools` | off | Tool invocations (searches, reads) |
+| `--show-edits` / `--hide-edits` | off | Full code content for file edits |
 
 `-v, --verbose` is an alias for `--show-tools`.
 
+`--compact` hides all metadata (model, agent, context, tools, timestamps).
+
 If you pass both show/hide forms for the same field, the last flag wins.
+
+### Timestamp Options
+
+When timestamps are enabled (`--show-timestamps`):
+
+| Flag | Description |
+| ---- | ----------- |
+| `--utc-time` | Render in UTC (default) |
+| `--local-time` | Render in local timezone |
+| `--timestamps-both` | Render as `<local> / <utc>` |
 
 ### Other Options
 
