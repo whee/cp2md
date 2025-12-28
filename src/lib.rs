@@ -22,8 +22,8 @@
 //! let chat = parser::parse_chat(&json).unwrap();
 //!
 //! let opts = renderer::RenderOptions {
-//!     show_tools: true,
-//!     show_timestamps: true,
+//!     tools: renderer::Visibility::Shown,
+//!     timestamps: renderer::TimestampDisplay::Zoned(renderer::TimestampZone::Utc),
 //!     ..Default::default()
 //! };
 //!

@@ -19,13 +19,14 @@
 //! # Example
 //!
 //! ```
+//! use chrono::{TimeZone, Utc};
 //! use cp2md::parser::{ChatExport, Request, Message, ResponseElement};
 //! use cp2md::renderer::{render_chat, RenderOptions};
 //!
 //! let chat = ChatExport {
 //!     responder_username: "GitHub Copilot".into(),
 //!     requests: vec![Request {
-//!         timestamp: 1733356800000,
+//!         timestamp: Some(Utc.timestamp_millis_opt(1_733_356_800_000).single().unwrap()),
 //!         model_id: Some("claude-sonnet-4".into()),
 //!         agent_name: None,
 //!         context: vec![],
@@ -43,8 +44,46 @@
 //! ```
 
 use crate::parser::{ChatExport, ContextItem, Request, ResponseElement};
-use chrono::DateTime;
-use std::fmt::Write;
+use chrono::{DateTime, Local, Utc};
+
+/// Timezone rendering selection for timestamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimestampZone {
+    /// Render timestamps in UTC (default).
+    Utc,
+    /// Render timestamps in the system local timezone.
+    Local,
+    /// Render both local and UTC timestamps.
+    Both,
+}
+
+/// Simple on/off visibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Visibility {
+    /// Do not render the element.
+    Hidden,
+    /// Render the element.
+    Shown,
+}
+
+/// How much detail to include for file edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditDisplay {
+    /// Only show a summary line.
+    SummaryOnly,
+    /// Include code blocks for the edits.
+    WithCode,
+}
+
+/// Timestamp rendering selection, including hiding entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimestampDisplay {
+    /// Do not render timestamps.
+    Hidden,
+    /// Render timestamps in the selected zone.
+    Zoned(TimestampZone),
+}
+use std::fmt::{self, Display, Formatter, Write};
 use std::path::Path;
 
 /// Configuration options for Markdown rendering.
@@ -57,34 +96,32 @@ pub struct RenderOptions {
     ///
     /// When enabled, tool calls (file reads, searches, etc.) are shown
     /// as blockquoted lines with a 🔧 prefix.
-    pub show_tools: bool,
+    pub tools: Visibility,
 
     /// Whether to include timestamps in the conversation metadata.
-    ///
-    /// When enabled, each user message shows when it was sent.
-    pub show_timestamps: bool,
+    pub timestamps: TimestampDisplay,
 
     /// Whether to include model identifiers in the conversation metadata.
     ///
     /// When disabled, model IDs like "claude-sonnet-4" are hidden.
-    pub show_model: bool,
+    pub model: Visibility,
 
     /// Whether to include the VS Code agent name in the conversation metadata.
     ///
     /// When enabled, shows the agent used (e.g., "@agent", "@documentation-reviewer").
-    pub show_agent: bool,
+    pub agent: Visibility,
 
     /// Whether to include attached context in the output.
     ///
     /// When enabled, shows files, selections, and instruction files that were
     /// attached to each request in a collapsible details block.
-    pub show_context: bool,
+    pub context: Visibility,
 
     /// Whether to include the actual code content of file edits.
     ///
     /// When enabled, `TextEditGroup` elements show the full code in a fenced
     /// block after the summary line. Default is off (summary only).
-    pub show_edits: bool,
+    pub edits: EditDisplay,
 
     /// Number of heading levels to shift (0-5).
     ///
@@ -96,12 +133,12 @@ pub struct RenderOptions {
 impl Default for RenderOptions {
     fn default() -> Self {
         Self {
-            show_tools: false,
-            show_timestamps: false,
-            show_model: true,
-            show_agent: true,
-            show_context: true,
-            show_edits: false,
+            tools: Visibility::Hidden,
+            timestamps: TimestampDisplay::Hidden,
+            model: Visibility::Shown,
+            agent: Visibility::Shown,
+            context: Visibility::Shown,
+            edits: EditDisplay::SummaryOnly,
             heading_offset: 0,
         }
     }
@@ -113,6 +150,62 @@ impl Default for RenderOptions {
 fn heading(level: u8, offset: u8) -> String {
     let actual = (level + offset).min(6);
     "#".repeat(actual as usize)
+}
+
+#[derive(Debug, Default)]
+struct CollectedResponse {
+    tools: Vec<String>,
+    chunks: Vec<RenderChunk>,
+}
+
+#[derive(Debug)]
+enum RenderChunk {
+    Text(String),
+    InlineReference(String),
+    TextEditSummary {
+        filename: String,
+        line_count: usize,
+        code: Option<RenderedCodeBlock>,
+    },
+}
+
+impl Display for RenderChunk {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(text) => f.write_str(text),
+            Self::InlineReference(display) => write!(f, "`{display}`"),
+            Self::TextEditSummary {
+                filename,
+                line_count,
+                code,
+            } => {
+                writeln!(f, "\n*Modified `{filename}` ({line_count} lines)*\n")?;
+                if let Some(block) = code {
+                    write!(f, "{block}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RenderedCodeBlock {
+    lang: &'static str,
+    edits: Vec<String>,
+}
+
+impl Display for RenderedCodeBlock {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        writeln!(f, "```{}", self.lang)?;
+        for (i, edit) in self.edits.iter().enumerate() {
+            if i > 0 {
+                f.write_str("\n// ...\n\n")?;
+            }
+            f.write_str(edit)?;
+        }
+        writeln!(f, "\n```")
+    }
 }
 
 /// Renders a parsed chat export as Markdown.
@@ -141,16 +234,20 @@ pub fn render_chat(chat: &ChatExport, opts: &RenderOptions) -> String {
 }
 
 fn render_request(out: &mut String, req: &Request, opts: &RenderOptions) {
-    let timestamp = DateTime::from_timestamp_millis(req.timestamp)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string());
+    let timestamp = match opts.timestamps {
+        TimestampDisplay::Hidden => None,
+        TimestampDisplay::Zoned(zone) => {
+            req.timestamp.as_ref().map(|dt| format_timestamp(dt, zone))
+        }
+    };
 
-    let model_id = if opts.show_model {
+    let model_id = if opts.model == Visibility::Shown {
         req.model_id.as_deref()
     } else {
         None
     };
 
-    let agent_name = if opts.show_agent {
+    let agent_name = if opts.agent == Visibility::Shown {
         req.agent_name.as_deref()
     } else {
         None
@@ -158,9 +255,7 @@ fn render_request(out: &mut String, req: &Request, opts: &RenderOptions) {
 
     // Build metadata parts
     let mut parts: Vec<String> = Vec::new();
-    if opts.show_timestamps
-        && let Some(ts) = &timestamp
-    {
+    if let Some(ts) = &timestamp {
         parts.push(ts.clone());
     }
     if let Some(model) = model_id {
@@ -182,22 +277,25 @@ fn render_request(out: &mut String, req: &Request, opts: &RenderOptions) {
     }
 
     // Render context if enabled and non-empty
-    if opts.show_context && !req.context.is_empty() {
+    if opts.context == Visibility::Shown && !req.context.is_empty() {
         render_context(out, &req.context);
     }
 
     // Shift headings in user content to prevent them from competing with
     // our document structure (H1 title, H2 sections). Shift by 2 + offset
     // so user H1 becomes H3+ (below our H2 section headers).
-    let shifted = shift_headings(&req.message.text, 2 + opts.heading_offset);
+    let heading_shift = 2 + opts.heading_offset;
+    let shifted = shift_headings(&req.message.text, heading_shift);
     writeln!(out, "{}\n", escape_xml_tags(&shifted)).unwrap();
 
-    if opts.show_tools {
-        render_tool_invocations(out, &req.response);
+    let response = collect_response(&req.response, opts, heading_shift);
+
+    if !response.tools.is_empty() {
+        render_tools(out, &response.tools);
     }
 
     writeln!(out, "{} Assistant\n", heading(2, opts.heading_offset)).unwrap();
-    render_response(out, &req.response, opts);
+    render_chunks(out, &response.chunks);
 }
 
 fn render_context(out: &mut String, context: &[ContextItem]) {
@@ -205,43 +303,37 @@ fn render_context(out: &mut String, context: &[ContextItem]) {
     writeln!(out, "<summary>📎 Context</summary>\n").unwrap();
 
     for item in context {
-        let formatted = format_context_item(item);
-        writeln!(out, "- {formatted}").unwrap();
+        writeln!(out, "- {item}").unwrap();
     }
 
     writeln!(out, "\n</details>\n").unwrap();
 }
 
-/// Formats a context item for display.
-///
-/// Uses smart path truncation: shows filename with full path in a link title
-/// for long paths (>30 chars), or just the path directly for short ones.
-fn format_context_item(item: &ContextItem) -> String {
-    match item {
-        ContextItem::File { name, path } => {
-            let display = format_path_display(name, path);
-            format!("{display} (file)")
-        }
-        ContextItem::Selection {
-            name,
-            path,
-            start_line,
-            end_line,
-        } => {
-            let range = if start_line == end_line {
-                format!(":{start_line}")
-            } else {
-                format!(":{start_line}-{end_line}")
-            };
-            let display = format_path_display(name, path);
-            format!("{display}{range} (selection)")
-        }
-        ContextItem::Folder { name, path } => {
-            let display = format_path_display(name, path);
-            format!("{display} (folder)")
-        }
-        ContextItem::Instructions { name } => {
-            format!("`{name}` (instructions)")
+impl Display for ContextItem {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::File { name, path } => {
+                write!(f, "{} (file)", format_path_display(name, path))
+            }
+            Self::Selection {
+                name,
+                path,
+                start_line,
+                end_line,
+            } => {
+                let range = if start_line == end_line {
+                    format!(":{start_line}")
+                } else {
+                    format!(":{start_line}-{end_line}")
+                };
+                write!(f, "{}{range} (selection)", format_path_display(name, path))
+            }
+            Self::Folder { name, path } => {
+                write!(f, "{} (folder)", format_path_display(name, path))
+            }
+            Self::Instructions { name } => {
+                write!(f, "`{name}` (instructions)")
+            }
         }
     }
 }
@@ -263,23 +355,13 @@ fn format_path_display(name: &str, path: &str) -> String {
     }
 }
 
-fn render_tool_invocations(out: &mut String, elements: &[ResponseElement]) {
-    let mut any_rendered = false;
-    for elem in elements {
-        if let ResponseElement::ToolInvocation {
-            past_tense: Some(msg),
-        } = elem
-        {
-            writeln!(out, "> 🔧 {}", escape_xml_tags(msg)).unwrap();
-            any_rendered = true;
-        }
-    }
-    if any_rendered {
-        out.push('\n');
-    }
-}
+fn collect_response(
+    elements: &[ResponseElement],
+    opts: &RenderOptions,
+    heading_shift: u8,
+) -> CollectedResponse {
+    let mut collected = CollectedResponse::default();
 
-fn render_response(out: &mut String, elements: &[ResponseElement], opts: &RenderOptions) {
     for elem in elements {
         match elem {
             ResponseElement::Text(text) => {
@@ -287,16 +369,22 @@ fn render_response(out: &mut String, elements: &[ResponseElement], opts: &Render
                 if trimmed.is_empty() || is_only_code_fences(trimmed) {
                     continue;
                 }
-                // Shift headings in assistant content to match user content treatment
-                let shifted = shift_headings(text, 2 + opts.heading_offset);
-                out.push_str(&escape_xml_tags(&shifted));
+
+                let shifted = shift_headings(text, heading_shift);
+                collected
+                    .chunks
+                    .push(RenderChunk::Text(escape_xml_tags(&shifted)));
             }
             ResponseElement::InlineReference { name, path } => {
                 let display = name
                     .as_deref()
                     .or_else(|| Path::new(path).file_name()?.to_str())
                     .unwrap_or(path);
-                write!(out, "`{}`", escape_for_inline_code(display)).unwrap();
+                collected
+                    .chunks
+                    .push(RenderChunk::InlineReference(escape_for_inline_code(
+                        display,
+                    )));
             }
             ResponseElement::TextEditGroup { path, edits } if !edits.is_empty() => {
                 let filename = Path::new(path)
@@ -304,28 +392,48 @@ fn render_response(out: &mut String, elements: &[ResponseElement], opts: &Render
                     .and_then(|f| f.to_str())
                     .unwrap_or(path);
                 let line_count: usize = edits.iter().map(|e| e.lines().count()).sum();
-                writeln!(
-                    out,
-                    "\n*Modified `{}` ({line_count} lines)*\n",
-                    escape_for_inline_code(filename)
-                )
-                .unwrap();
+                let code = if opts.edits == EditDisplay::WithCode {
+                    Some(RenderedCodeBlock {
+                        lang: extension_to_language(path),
+                        edits: edits.clone(),
+                    })
+                } else {
+                    None
+                };
 
-                if opts.show_edits {
-                    let lang = extension_to_language(path);
-                    writeln!(out, "```{lang}").unwrap();
-                    for (i, edit) in edits.iter().enumerate() {
-                        if i > 0 {
-                            out.push_str("\n// ...\n\n");
-                        }
-                        out.push_str(edit);
-                    }
-                    writeln!(out, "\n```\n").unwrap();
-                }
+                collected.chunks.push(RenderChunk::TextEditSummary {
+                    filename: escape_for_inline_code(filename),
+                    line_count,
+                    code,
+                });
+            }
+            ResponseElement::ToolInvocation {
+                past_tense: Some(msg),
+            } if opts.tools == Visibility::Shown => {
+                collected.tools.push(escape_xml_tags(msg));
             }
             _ => {}
         }
     }
+
+    collected
+}
+
+fn render_tools(out: &mut String, tools: &[String]) {
+    for msg in tools {
+        writeln!(out, "> 🔧 {msg}").unwrap();
+    }
+
+    if !tools.is_empty() {
+        out.push('\n');
+    }
+}
+
+fn render_chunks(out: &mut String, chunks: &[RenderChunk]) {
+    for chunk in chunks {
+        write!(out, "{chunk}").unwrap();
+    }
+
     out.push_str("\n\n");
 }
 
@@ -496,10 +604,31 @@ fn escape_xml_tags(s: &str) -> String {
     result
 }
 
+fn format_timestamp(dt: &DateTime<Utc>, zone: TimestampZone) -> String {
+    match zone {
+        TimestampZone::Utc => dt.format("%Y-%m-%d %H:%M UTC").to_string(),
+        TimestampZone::Local => dt
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M %Z")
+            .to_string(),
+        TimestampZone::Both => {
+            let local = dt
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M %Z")
+                .to_string();
+            let utc = dt.format("%Y-%m-%d %H:%M UTC").to_string();
+            format!("{local} / {utc}")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parser::{ChatExport, Message, Request, ResponseElement};
+    use chrono::{Local, TimeZone, Utc};
+
+    const TS_MS: i64 = 1_733_356_800_000; // 2024-12-05 00:00:00 UTC
 
     fn make_chat(requests: Vec<Request>) -> ChatExport {
         ChatExport {
@@ -510,7 +639,7 @@ mod tests {
 
     fn make_request(message: &str, response: Vec<ResponseElement>) -> Request {
         Request {
-            timestamp: 1_733_356_800_000, // 2024-12-05 00:00:00 UTC
+            timestamp: Some(Utc.timestamp_millis_opt(TS_MS).single().unwrap()),
             model_id: Some("claude-sonnet-4".into()),
             agent_name: None,
             context: vec![],
@@ -572,8 +701,8 @@ mod tests {
     fn renders_model_id_when_no_timestamps() {
         let chat = make_chat(vec![make_request("Hi", vec![])]);
         let opts = RenderOptions {
-            show_tools: false,
-            show_timestamps: false,
+            tools: Visibility::Hidden,
+            timestamps: TimestampDisplay::Hidden,
             ..Default::default()
         };
         let output = render_chat(&chat, &opts);
@@ -585,13 +714,81 @@ mod tests {
     fn renders_timestamp_and_model_when_enabled() {
         let chat = make_chat(vec![make_request("Hi", vec![])]);
         let opts = RenderOptions {
-            show_tools: false,
-            show_timestamps: true,
+            tools: Visibility::Hidden,
+            timestamps: TimestampDisplay::Zoned(TimestampZone::Utc),
             ..Default::default()
         };
         let output = render_chat(&chat, &opts);
 
         assert!(output.contains("2024-12-05 00:00 UTC"));
+        assert!(output.contains("claude-sonnet-4"));
+    }
+
+    #[test]
+    fn renders_timestamp_in_local_timezone_when_requested() {
+        let chat = make_chat(vec![make_request("Hi", vec![])]);
+        let opts = RenderOptions {
+            tools: Visibility::Hidden,
+            timestamps: TimestampDisplay::Zoned(TimestampZone::Local),
+            ..Default::default()
+        };
+        let output = render_chat(&chat, &opts);
+
+        let expected = Utc
+            .timestamp_millis_opt(TS_MS)
+            .single()
+            .unwrap()
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M %Z")
+            .to_string();
+
+        assert!(output.contains(&expected));
+        assert!(!output.contains("UTC"));
+    }
+
+    #[test]
+    fn renders_timestamp_in_both_timezones_when_requested() {
+        let chat = make_chat(vec![make_request("Hi", vec![])]);
+        let opts = RenderOptions {
+            tools: Visibility::Hidden,
+            timestamps: TimestampDisplay::Zoned(TimestampZone::Both),
+            ..Default::default()
+        };
+        let output = render_chat(&chat, &opts);
+
+        let utc = Utc
+            .timestamp_millis_opt(TS_MS)
+            .single()
+            .unwrap()
+            .format("%Y-%m-%d %H:%M UTC")
+            .to_string();
+        let local = Utc
+            .timestamp_millis_opt(TS_MS)
+            .single()
+            .unwrap()
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M %Z")
+            .to_string();
+
+        let expected = format!("{local} / {utc}");
+
+        assert!(output.contains(&expected));
+    }
+
+    #[test]
+    fn omits_timestamp_when_missing() {
+        let mut req = make_request("Hi", vec![]);
+        req.timestamp = None;
+
+        let chat = make_chat(vec![req]);
+        let opts = RenderOptions {
+            tools: Visibility::Hidden,
+            timestamps: TimestampDisplay::Zoned(TimestampZone::Utc),
+            ..Default::default()
+        };
+        let output = render_chat(&chat, &opts);
+
+        assert!(!output.contains("UTC"));
         assert!(output.contains("claude-sonnet-4"));
     }
 
@@ -661,8 +858,8 @@ mod tests {
             }],
         )]);
         let opts = RenderOptions {
-            show_tools: false,
-            show_timestamps: false,
+            tools: Visibility::Hidden,
+            timestamps: TimestampDisplay::Hidden,
             ..Default::default()
         };
         let output = render_chat(&chat, &opts);
@@ -680,8 +877,8 @@ mod tests {
             }],
         )]);
         let opts = RenderOptions {
-            show_tools: true,
-            show_timestamps: false,
+            tools: Visibility::Shown,
+            timestamps: TimestampDisplay::Hidden,
             ..Default::default()
         };
         let output = render_chat(&chat, &opts);
@@ -696,8 +893,8 @@ mod tests {
             vec![ResponseElement::ToolInvocation { past_tense: None }],
         )]);
         let opts = RenderOptions {
-            show_tools: true,
-            show_timestamps: false,
+            tools: Visibility::Shown,
+            timestamps: TimestampDisplay::Hidden,
             ..Default::default()
         };
         let output = render_chat(&chat, &opts);
@@ -861,8 +1058,8 @@ mod tests {
             }],
         )]);
         let opts = RenderOptions {
-            show_tools: true,
-            show_timestamps: false,
+            tools: Visibility::Shown,
+            timestamps: TimestampDisplay::Hidden,
             ..Default::default()
         };
         let output = render_chat(&chat, &opts);
@@ -1056,7 +1253,7 @@ mod tests {
             }],
         )]);
         let opts = RenderOptions {
-            show_edits: true,
+            edits: EditDisplay::WithCode,
             ..Default::default()
         };
         let output = render_chat(&chat, &opts);
@@ -1077,7 +1274,7 @@ mod tests {
             }],
         )]);
         let opts = RenderOptions {
-            show_edits: true,
+            edits: EditDisplay::WithCode,
             ..Default::default()
         };
         let output = render_chat(&chat, &opts);

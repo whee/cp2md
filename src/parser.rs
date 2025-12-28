@@ -32,7 +32,9 @@
 //! assert_eq!(chat.requests.len(), 1);
 //! ```
 
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use serde::de::Error as DeError;
 use snafu::prelude::*;
 
 /// Error type for JSON parsing failures.
@@ -66,8 +68,8 @@ pub struct ChatExport {
 /// assistant response, along with metadata like timestamps and model info.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
-    /// Unix timestamp in milliseconds when the request was made.
-    pub timestamp: i64,
+    /// When present, the time the request was made.
+    pub timestamp: Option<DateTime<Utc>>,
 
     /// The model identifier used for this response (e.g., "claude-sonnet-4").
     ///
@@ -229,25 +231,34 @@ impl<'de> Deserialize<'de> for Request {
     {
         let value = serde_json::Value::deserialize(deserializer)?;
 
-        let timestamp = value
-            .get("timestamp")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(0);
+        let timestamp = match value.get("timestamp") {
+            None => None,
+            Some(raw) => {
+                let millis = raw
+                    .as_i64()
+                    .ok_or_else(|| DeError::custom("timestamp must be an integer (ms)"))?;
+
+                let dt = DateTime::<Utc>::from_timestamp_millis(millis)
+                    .ok_or_else(|| DeError::custom("timestamp out of range"))?;
+
+                Some(dt)
+            }
+        };
 
         let model_id = get_string(&value, &["modelId"]);
         let agent_name = get_string(&value, &["agent", "name"]);
 
-        let message = value
+        let message_value = value
             .get("message")
-            .and_then(|m| serde_json::from_value(m.clone()).ok())
-            .unwrap_or(Message {
-                text: String::new(),
-            });
+            .ok_or_else(|| DeError::missing_field("message"))?;
 
-        let response = value
+        let message = serde_json::from_value(message_value.clone()).map_err(DeError::custom)?;
+
+        let response_value = value
             .get("response")
-            .and_then(|r| serde_json::from_value(r.clone()).ok())
-            .unwrap_or_default();
+            .ok_or_else(|| DeError::missing_field("response"))?;
+
+        let response = serde_json::from_value(response_value.clone()).map_err(DeError::custom)?;
 
         let context = extract_context(&value);
 
@@ -414,6 +425,7 @@ pub fn parse_chat(json_str: &str) -> Result<ChatExport, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Utc};
 
     fn minimal_chat_json(requests_json: &str) -> String {
         format!(
@@ -468,6 +480,14 @@ mod tests {
         assert_eq!(chat.requests.len(), 1);
         assert_eq!(chat.requests[0].message.text, "Hello");
         assert_eq!(chat.requests[0].model_id, Some("claude-sonnet-4".into()));
+        assert_eq!(
+            chat.requests[0].timestamp,
+            Some(
+                Utc.timestamp_millis_opt(1_733_356_800_000)
+                    .single()
+                    .unwrap()
+            )
+        );
     }
 
     #[test]
@@ -686,6 +706,49 @@ mod tests {
     }
 
     #[test]
+    fn parses_request_without_timestamp() {
+        let json = r#"{
+            "responderUsername": "Copilot",
+            "requests": [{
+                "message": { "text": "Hi" },
+                "response": []
+            }]
+        }"#;
+
+        let chat = parse_chat(json).unwrap();
+
+        assert!(chat.requests[0].timestamp.is_none());
+    }
+
+    #[test]
+    fn errors_on_non_integer_timestamp() {
+        let json = r#"{
+            "responderUsername": "Copilot",
+            "requests": [{
+                "timestamp": "not-a-number",
+                "message": { "text": "Hi" },
+                "response": []
+            }]
+        }"#;
+
+        assert!(parse_chat(json).is_err());
+    }
+
+    #[test]
+    fn errors_on_out_of_range_timestamp() {
+        let json = r#"{
+            "responderUsername": "Copilot",
+            "requests": [{
+                "timestamp": 9_223_372_036_854_775_807,
+                "message": { "text": "Hi" },
+                "response": []
+            }]
+        }"#;
+
+        assert!(parse_chat(json).is_err());
+    }
+
+    #[test]
     fn parses_agent_name() {
         let json = minimal_chat_json(&request_json_with_agent("Hi", "documentation-reviewer"));
         let chat = parse_chat(&json).unwrap();
@@ -833,5 +896,31 @@ mod tests {
     fn returns_error_for_missing_required_fields() {
         let result = parse_chat(r#"{"responderUsername": "Copilot"}"#);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn errors_when_message_missing() {
+        let json = r#"{
+            "responderUsername": "Copilot",
+            "requests": [{
+                "timestamp": 1733356800000,
+                "response": []
+            }]
+        }"#;
+
+        assert!(parse_chat(json).is_err());
+    }
+
+    #[test]
+    fn errors_when_response_missing() {
+        let json = r#"{
+            "responderUsername": "Copilot",
+            "requests": [{
+                "timestamp": 1733356800000,
+                "message": { "text": "Hi" }
+            }]
+        }"#;
+
+        assert!(parse_chat(json).is_err());
     }
 }

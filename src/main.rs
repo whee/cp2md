@@ -9,10 +9,13 @@
 use cp2md::{parser, renderer};
 use lexopt::prelude::*;
 use snafu::{OptionExt, ensure, prelude::*};
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+};
 
+use walkdir::WalkDir;
 /// Where to write the rendered output.
 #[derive(Clone, Debug)]
 enum OutputTarget {
@@ -30,12 +33,12 @@ struct Cli {
     input: Vec<PathBuf>,
     output: OutputTarget,
     concat: bool,
-    show_tools: bool,
-    show_timestamps: bool,
-    show_model: bool,
-    show_agent: bool,
-    show_context: bool,
-    show_edits: bool,
+    tools: renderer::Visibility,
+    timestamps: renderer::TimestampDisplay,
+    model: renderer::Visibility,
+    agent: renderer::Visibility,
+    context: renderer::Visibility,
+    edits: renderer::EditDisplay,
     heading_offset: u8,
     quiet: bool,
     dry_run: bool,
@@ -49,6 +52,16 @@ enum Error {
 
     #[snafu(display("heading-offset must be 0-5"))]
     InvalidHeadingOffset,
+
+    #[snafu(display(
+        "conflicting timestamp flags: already set to {:?}, got {:?}",
+        first,
+        second
+    ))]
+    ConflictingTimestampFlags {
+        first: renderer::TimestampZone,
+        second: renderer::TimestampZone,
+    },
 
     #[snafu(display("missing required option: --output"))]
     MissingOutput,
@@ -93,6 +106,96 @@ enum Error {
     FileOutputRequiresConcat { path: PathBuf },
 }
 
+#[derive(Clone, Debug)]
+struct RenderFlagState {
+    tools: renderer::Visibility,
+    model: renderer::Visibility,
+    agent: renderer::Visibility,
+    context: renderer::Visibility,
+    edits: renderer::EditDisplay,
+    timestamps: renderer::TimestampDisplay,
+    timestamp_preference: Option<renderer::TimestampZone>,
+}
+
+impl RenderFlagState {
+    const fn new() -> Self {
+        Self {
+            tools: renderer::Visibility::Hidden,
+            model: renderer::Visibility::Shown,
+            agent: renderer::Visibility::Shown,
+            context: renderer::Visibility::Shown,
+            edits: renderer::EditDisplay::SummaryOnly,
+            timestamps: renderer::TimestampDisplay::Hidden,
+            timestamp_preference: None,
+        }
+    }
+
+    const fn apply_compact(&mut self) {
+        self.tools = renderer::Visibility::Hidden;
+        self.model = renderer::Visibility::Hidden;
+        self.agent = renderer::Visibility::Hidden;
+        self.context = renderer::Visibility::Hidden;
+        self.timestamps = renderer::TimestampDisplay::Hidden;
+    }
+
+    fn set_timestamp_zone(&mut self, zone: renderer::TimestampZone) -> Result<(), Error> {
+        if let Some(first) = self.timestamp_preference.filter(|current| *current != zone) {
+            return ConflictingTimestampFlagsSnafu {
+                first,
+                second: zone,
+            }
+            .fail();
+        }
+
+        self.timestamp_preference = Some(zone);
+
+        self.timestamps = renderer::TimestampDisplay::Zoned(zone);
+
+        Ok(())
+    }
+
+    fn show_timestamps(&mut self) {
+        let zone = self
+            .timestamp_preference
+            .unwrap_or(renderer::TimestampZone::Utc);
+        self.timestamps = renderer::TimestampDisplay::Zoned(zone);
+    }
+
+    const fn hide_timestamps(&mut self) {
+        self.timestamps = renderer::TimestampDisplay::Hidden;
+    }
+
+    fn finalize(self) -> RenderFlags {
+        let zone = self
+            .timestamp_preference
+            .unwrap_or(renderer::TimestampZone::Utc);
+
+        let timestamps = match self.timestamps {
+            renderer::TimestampDisplay::Hidden => renderer::TimestampDisplay::Hidden,
+            renderer::TimestampDisplay::Zoned(_) => renderer::TimestampDisplay::Zoned(zone),
+        };
+
+        RenderFlags {
+            tools: self.tools,
+            model: self.model,
+            agent: self.agent,
+            context: self.context,
+            edits: self.edits,
+            timestamps,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RenderFlags {
+    tools: renderer::Visibility,
+    model: renderer::Visibility,
+    agent: renderer::Visibility,
+    context: renderer::Visibility,
+    edits: renderer::EditDisplay,
+    timestamps: renderer::TimestampDisplay,
+}
+
 fn print_help() {
     println!(
         "\
@@ -105,13 +208,16 @@ Arguments:
   <INPUT>...  Input JSON files or directories containing exports
 
 Options:
-  -o, --output <OUTPUT>     Output directory (or file with --concat, or - for stdout)
+    -o, --output <OUTPUT>     Output directory (or file with --concat; - for stdout)
       --concat              Combine all inputs into a single output
       --heading-offset <N>  Shift heading levels by N (0-5, default: 0)
 
 Metadata display (use --show-* or --hide-*):
       --show-timestamps     Include timestamps (default: off)
       --hide-timestamps     Hide timestamps
+      --local-time          Render timestamps in the local timezone (default: UTC)
+      --utc-time            Render timestamps in UTC (default)
+      --timestamps-both     Render timestamps as <local> / <utc>
       --show-model          Include model ID (default: on)
       --hide-model          Hide model ID
       --show-agent          Include agent name (default: on)
@@ -142,7 +248,7 @@ fn parse_args() -> Result<Cli, Error> {
         print_help();
         std::process::exit(0);
     }
-    parse_args_from(std::env::args())
+    parse_args_from(std::env::args().skip(1))
 }
 
 fn parse_args_from(
@@ -151,13 +257,7 @@ fn parse_args_from(
     let mut input = Vec::new();
     let mut output: Option<OutputTarget> = None;
     let mut concat = false;
-    // Defaults: tools off, timestamps off, edits off, model on, agent on, context on
-    let mut show_tools = false;
-    let mut show_timestamps = false;
-    let mut show_model = true;
-    let mut show_agent = true;
-    let mut show_context = true;
-    let mut show_edits = false;
+    let mut flags = RenderFlagState::new();
     let mut heading_offset: u8 = 0;
     let mut quiet = false;
     let mut dry_run = false;
@@ -179,25 +279,32 @@ fn parse_args_from(
                 });
             }
             Long("concat") => concat = true,
-            // Show/hide flags - last one wins
-            Short('v') | Long("verbose" | "show-tools") => show_tools = true,
-            Long("hide-tools") => show_tools = false,
-            Long("show-timestamps") => show_timestamps = true,
-            Long("hide-timestamps") => show_timestamps = false,
-            Long("show-model") => show_model = true,
-            Long("hide-model" | "no-model") => show_model = false,
-            Long("show-agent") => show_agent = true,
-            Long("hide-agent") => show_agent = false,
-            Long("show-context") => show_context = true,
-            Long("hide-context") => show_context = false,
-            Long("show-edits") => show_edits = true,
-            Long("hide-edits") => show_edits = false,
+            // Show/hide toggles; timestamp flags are validated for conflicts
+            Short('v') | Long("verbose" | "show-tools") => {
+                flags.tools = renderer::Visibility::Shown;
+            }
+            Long("hide-tools") => {
+                flags.tools = renderer::Visibility::Hidden;
+            }
+            Long("show-timestamps") => {
+                flags.show_timestamps();
+            }
+            Long("hide-timestamps") => {
+                flags.hide_timestamps();
+            }
+            Long("local-time") => flags.set_timestamp_zone(renderer::TimestampZone::Local)?,
+            Long("utc-time") => flags.set_timestamp_zone(renderer::TimestampZone::Utc)?,
+            Long("timestamps-both") => flags.set_timestamp_zone(renderer::TimestampZone::Both)?,
+            Long("show-model") => flags.model = renderer::Visibility::Shown,
+            Long("hide-model" | "no-model") => flags.model = renderer::Visibility::Hidden,
+            Long("show-agent") => flags.agent = renderer::Visibility::Shown,
+            Long("hide-agent") => flags.agent = renderer::Visibility::Hidden,
+            Long("show-context") => flags.context = renderer::Visibility::Shown,
+            Long("hide-context") => flags.context = renderer::Visibility::Hidden,
+            Long("show-edits") => flags.edits = renderer::EditDisplay::WithCode,
+            Long("hide-edits") => flags.edits = renderer::EditDisplay::SummaryOnly,
             Long("compact") => {
-                show_model = false;
-                show_agent = false;
-                show_context = false;
-                show_tools = false;
-                show_timestamps = false;
+                flags.apply_compact();
             }
             Long("heading-offset") => {
                 let val: u8 = parser
@@ -230,16 +337,18 @@ fn parse_args_from(
         _ => output,
     };
 
+    let flags = flags.finalize();
+
     Ok(Cli {
         input,
         output,
         concat,
-        show_tools,
-        show_timestamps,
-        show_model,
-        show_agent,
-        show_context,
-        show_edits,
+        tools: flags.tools,
+        timestamps: flags.timestamps,
+        model: flags.model,
+        agent: flags.agent,
+        context: flags.context,
+        edits: flags.edits,
         heading_offset,
         quiet,
         dry_run,
@@ -266,7 +375,7 @@ fn main() -> Result<(), Error> {
             }
             OutputTarget::Directory(dir) => {
                 if !cli.dry_run {
-                    std::fs::create_dir_all(dir).context(CreateOutputDirSnafu)?;
+                    fs::create_dir_all(dir).context(CreateOutputDirSnafu)?;
                 }
                 for file in &files {
                     process_file(file, dir, &cli)?;
@@ -314,38 +423,98 @@ fn collect_input_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
 }
 
 /// Creates render options from CLI arguments.
-#[allow(clippy::missing_const_for_fn)]
-fn make_render_options(cli: &Cli) -> renderer::RenderOptions {
+const fn make_render_options(cli: &Cli) -> renderer::RenderOptions {
     renderer::RenderOptions {
-        show_tools: cli.show_tools,
-        show_timestamps: cli.show_timestamps,
-        show_model: cli.show_model,
-        show_agent: cli.show_agent,
-        show_context: cli.show_context,
-        show_edits: cli.show_edits,
+        tools: cli.tools,
+        timestamps: cli.timestamps,
+        model: cli.model,
+        agent: cli.agent,
+        context: cli.context,
+        edits: cli.edits,
         heading_offset: cli.heading_offset,
     }
 }
 
 /// Loads a chat file, ensuring all callers surface consistent error context.
 fn load_chat(path: &Path) -> Result<parser::ChatExport, Error> {
-    let json = std::fs::read_to_string(path).context(ReadFileSnafu { path })?;
+    let json = fs::read_to_string(path).context(ReadFileSnafu { path })?;
     parser::parse_chat(&json).context(ParseFileSnafu { path })
 }
 
-/// Processes a single file and outputs to stdout.
+/// Processes a single file and outputs to stdout via a shared plan.
 fn process_to_stdout(input: &Path, cli: &Cli) -> Result<(), Error> {
-    if cli.dry_run {
-        eprintln!("Would output {}", input.display());
-        return Ok(());
-    }
-
     let chat = load_chat(input)?;
 
     let opts = make_render_options(cli);
     let markdown = renderer::render_chat(&chat, &opts);
 
-    print!("{markdown}");
+    let plan = OutputPlan {
+        destination: OutputDestination::Stdout,
+        description: Some(input.display().to_string()),
+        content: markdown,
+    };
+
+    apply_output_plan(plan, cli)
+}
+
+/// Planned output destination.
+enum OutputDestination {
+    Stdout,
+    File(PathBuf),
+}
+
+/// A rendered artifact and where it should be written.
+struct OutputPlan {
+    destination: OutputDestination,
+    description: Option<String>,
+    content: String,
+}
+
+fn apply_output_plan(plan: OutputPlan, cli: &Cli) -> Result<(), Error> {
+    match plan.destination {
+        OutputDestination::Stdout => {
+            if cli.dry_run {
+                if let Some(desc) = plan.description.as_deref() {
+                    eprintln!("Would output {desc}");
+                } else {
+                    eprintln!("Would output to stdout");
+                }
+            } else {
+                print!("{}", plan.content);
+            }
+        }
+        OutputDestination::File(path) => {
+            if cli.dry_run {
+                eprintln!("Would write {}", path.display());
+                return Ok(());
+            }
+
+            if path.exists() && !cli.force {
+                eprintln!(
+                    "Skipping {} (already exists, use --force to overwrite)",
+                    path.display()
+                );
+                return Ok(());
+            }
+
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                fs::create_dir_all(parent).context(CreateOutputDirSnafu)?;
+            }
+
+            fs::write(&path, &plan.content).context(WriteFileSnafu { path: &path })?;
+
+            if !cli.quiet {
+                if let Some(desc) = plan.description.as_deref() {
+                    eprintln!("Wrote {} ({desc})", path.display());
+                } else {
+                    eprintln!("Wrote {}", path.display());
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -370,43 +539,20 @@ fn process_concat(files: &[PathBuf], cli: &Cli) -> Result<(), Error> {
     let opts = make_render_options(cli);
     let output = render_concat(&chats, &opts);
 
-    match &cli.output {
-        OutputTarget::Stdout => {
-            if cli.dry_run {
-                eprintln!("Would output {} files concatenated", files.len());
-            } else {
-                print!("{output}");
-            }
-        }
+    let destination = match &cli.output {
+        OutputTarget::Stdout => OutputDestination::Stdout,
         OutputTarget::File(path) | OutputTarget::Directory(path) => {
-            // In concat mode, treat path as a file, not directory
-            if cli.dry_run {
-                eprintln!(
-                    "Would write {} ({} files concatenated)",
-                    path.display(),
-                    files.len()
-                );
-            } else if path.exists() && !cli.force {
-                eprintln!(
-                    "Skipping {} (already exists, use --force to overwrite)",
-                    path.display()
-                );
-            } else {
-                // Create parent directory if needed
-                if let Some(parent) = path.parent()
-                    && !parent.as_os_str().is_empty()
-                {
-                    std::fs::create_dir_all(parent).context(CreateOutputDirSnafu)?;
-                }
-                std::fs::write(path, &output).context(WriteFileSnafu { path })?;
-                if !cli.quiet {
-                    eprintln!("Wrote {} ({} files)", path.display(), files.len());
-                }
-            }
+            OutputDestination::File(path.clone())
         }
-    }
+    };
 
-    Ok(())
+    let plan = OutputPlan {
+        destination,
+        description: Some(format!("{} files concatenated", files.len())),
+        content: output,
+    };
+
+    apply_output_plan(plan, cli)
 }
 
 /// Processes a single file and writes to the output directory.
@@ -414,14 +560,7 @@ fn process_file(input: &Path, out_dir: &Path, cli: &Cli) -> Result<(), Error> {
     let out_name = input.file_stem().context(InvalidFilenameSnafu)?;
     let out_path = out_dir.join(format!("{}.md", out_name.to_string_lossy()));
 
-    // Handle dry-run mode
-    if cli.dry_run {
-        eprintln!("Would write {}", out_path.display());
-        return Ok(());
-    }
-
-    // Check if output exists and handle overwrite
-    if out_path.exists() && !cli.force {
+    if !cli.dry_run && out_path.exists() && !cli.force {
         eprintln!(
             "Skipping {} (already exists, use --force to overwrite)",
             out_path.display()
@@ -434,12 +573,13 @@ fn process_file(input: &Path, out_dir: &Path, cli: &Cli) -> Result<(), Error> {
     let opts = make_render_options(cli);
     let markdown = renderer::render_chat(&chat, &opts);
 
-    std::fs::write(&out_path, &markdown).context(WriteFileSnafu { path: &out_path })?;
+    let plan = OutputPlan {
+        destination: OutputDestination::File(out_path),
+        description: None,
+        content: markdown,
+    };
 
-    if !cli.quiet {
-        eprintln!("Wrote {}", out_path.display());
-    }
-    Ok(())
+    apply_output_plan(plan, cli)
 }
 
 #[cfg(test)]
@@ -459,76 +599,102 @@ mod tests {
 
     #[test]
     fn parses_output_to_stdout() {
-        let cli = parse_args_from(args("cp2md input.json -o -")).unwrap();
+        let cli = parse_args_from(args("input.json -o -")).unwrap();
         assert!(matches!(cli.output, OutputTarget::Stdout));
     }
 
     #[test]
     fn parses_output_to_directory() {
-        let cli = parse_args_from(args("cp2md input.json -o out/")).unwrap();
+        let cli = parse_args_from(args("input.json -o out/")).unwrap();
         assert!(matches!(cli.output, OutputTarget::Directory(_)));
     }
 
     #[test]
     fn error_on_missing_output() {
-        let err = parse_args_from(args("cp2md input.json")).unwrap_err();
+        let err = parse_args_from(args("input.json")).unwrap_err();
         assert!(matches!(err, Error::MissingOutput));
     }
 
     #[test]
     fn error_on_invalid_heading_offset() {
-        let err = parse_args_from(args("cp2md -o - --heading-offset 7 x.json")).unwrap_err();
+        let err = parse_args_from(args("-o - --heading-offset 7 x.json")).unwrap_err();
         assert!(matches!(err, Error::InvalidHeadingOffset));
     }
 
     #[test]
     fn concat_converts_directory_to_file_target() {
-        let cli = parse_args_from(args("cp2md --concat -o out.md input.json")).unwrap();
+        let cli = parse_args_from(args("--concat -o out.md input.json")).unwrap();
         assert!(matches!(cli.output, OutputTarget::File(_)));
     }
 
     #[test]
     fn verbose_enables_show_tools() {
-        let cli = parse_args_from(args("cp2md -v -o - x.json")).unwrap();
-        assert!(cli.show_tools);
+        let cli = parse_args_from(args("-v -o - x.json")).unwrap();
+        assert!(matches!(cli.tools, renderer::Visibility::Shown));
     }
 
     #[test]
     fn last_flag_wins() {
-        let cli = parse_args_from(args("cp2md --show-model --hide-model -o - x.json")).unwrap();
-        assert!(!cli.show_model);
+        let cli = parse_args_from(args("--show-model --hide-model -o - x.json")).unwrap();
+        assert!(matches!(cli.model, renderer::Visibility::Hidden));
     }
 
     #[test]
     fn show_edits_flag_parsed() {
-        let cli = parse_args_from(args("cp2md --show-edits -o - x.json")).unwrap();
-        assert!(cli.show_edits);
+        let cli = parse_args_from(args("--show-edits -o - x.json")).unwrap();
+        assert!(matches!(cli.edits, renderer::EditDisplay::WithCode));
+    }
+
+    #[test]
+    fn local_time_flag_parsed() {
+        let cli = parse_args_from(args("--local-time -o - x.json")).unwrap();
+        assert!(matches!(
+            cli.timestamps,
+            renderer::TimestampDisplay::Zoned(renderer::TimestampZone::Local)
+        ));
+    }
+
+    #[test]
+    fn errors_on_conflicting_timestamp_flags() {
+        let err = parse_args_from(args("--local-time --utc-time -o - x.json")).unwrap_err();
+        assert!(matches!(err, Error::ConflictingTimestampFlags { .. }));
+    }
+
+    #[test]
+    fn timestamps_both_conflicts_with_specific_zone() {
+        let err = parse_args_from(args("--timestamps-both --local-time -o - x.json")).unwrap_err();
+        assert!(matches!(err, Error::ConflictingTimestampFlags { .. }));
+    }
+
+    #[test]
+    fn both_timezones_flag_parsed() {
+        let cli = parse_args_from(args("--timestamps-both -o - x.json")).unwrap();
+        assert!(matches!(
+            cli.timestamps,
+            renderer::TimestampDisplay::Zoned(renderer::TimestampZone::Both)
+        ));
     }
 
     #[test]
     fn compact_disables_all_metadata() {
-        let cli = parse_args_from(args("cp2md --compact -o - x.json")).unwrap();
-        assert!(!cli.show_model);
-        assert!(!cli.show_agent);
-        assert!(!cli.show_context);
-        assert!(!cli.show_tools);
-        assert!(!cli.show_timestamps);
-        // show_edits is not affected by compact
-        assert!(!cli.show_edits);
+        let cli = parse_args_from(args("--compact -o - x.json")).unwrap();
+        assert!(matches!(cli.model, renderer::Visibility::Hidden));
+        assert!(matches!(cli.agent, renderer::Visibility::Hidden));
+        assert!(matches!(cli.context, renderer::Visibility::Hidden));
+        assert!(matches!(cli.tools, renderer::Visibility::Hidden));
+        assert!(matches!(cli.timestamps, renderer::TimestampDisplay::Hidden));
+        assert!(matches!(cli.edits, renderer::EditDisplay::SummaryOnly));
     }
 
     #[test]
     fn compact_can_be_overridden() {
-        let cli = parse_args_from(args(
-            "cp2md --compact --show-model --show-edits -o - x.json",
-        ))
-        .unwrap();
+        let cli = parse_args_from(args("--compact --show-model --show-edits -o - x.json")).unwrap();
         // Last flag wins: show-model after compact re-enables it
-        assert!(cli.show_model);
-        assert!(cli.show_edits);
+        assert!(matches!(cli.model, renderer::Visibility::Shown));
+        assert!(matches!(cli.edits, renderer::EditDisplay::WithCode));
         // These remain disabled from compact
-        assert!(!cli.show_agent);
-        assert!(!cli.show_context);
+        assert!(matches!(cli.agent, renderer::Visibility::Hidden));
+        assert!(matches!(cli.context, renderer::Visibility::Hidden));
     }
 
     // =========================================================================

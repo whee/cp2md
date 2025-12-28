@@ -70,8 +70,8 @@ fn verbose_output_includes_tools() {
 
     // Without verbose flag
     let quiet_opts = renderer::RenderOptions {
-        show_tools: false,
-        show_timestamps: false,
+        tools: renderer::Visibility::Hidden,
+        timestamps: renderer::TimestampDisplay::Hidden,
         ..Default::default()
     };
     let quiet_output = renderer::render_chat(&chat, &quiet_opts);
@@ -82,8 +82,8 @@ fn verbose_output_includes_tools() {
 
     // With verbose flag
     let verbose_opts = renderer::RenderOptions {
-        show_tools: true,
-        show_timestamps: false,
+        tools: renderer::Visibility::Shown,
+        timestamps: renderer::TimestampDisplay::Hidden,
         ..Default::default()
     };
     let verbose_output = renderer::render_chat(&chat, &verbose_opts);
@@ -109,8 +109,8 @@ fn timestamps_formatted_correctly() {
     let chat = parser::parse_chat(json).unwrap();
 
     let opts = renderer::RenderOptions {
-        show_tools: false,
-        show_timestamps: true,
+        tools: renderer::Visibility::Hidden,
+        timestamps: renderer::TimestampDisplay::Zoned(renderer::TimestampZone::Utc),
         ..Default::default()
     };
     let output = renderer::render_chat(&chat, &opts);
