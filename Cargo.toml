@@ -8,14 +8,14 @@ name         = "cp2md"
 readme       = "README.md"
 repository   = "https://github.com/whee/cp2md"
 rust-version = "1.91"
-version      = "1.5.0"
+version      = "1.5.1"
 
 [dependencies]
 chrono     = { version = "0.4", features = ["serde"] }
 lexopt     = "0.3"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
-snafu      = "0.8"
+snafu      = { version = "0.8", features = ["rust_1_81"] }
 walkdir    = "2"
 
 [lints.rust]
