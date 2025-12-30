@@ -902,4 +902,35 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn show_timestamps_flag_enables_timestamps() {
+        let cli = parse_args_from(args("--show-timestamps -o - x.json")).unwrap();
+        assert!(matches!(
+            cli.timestamps,
+            renderer::TimestampDisplay::Zoned(renderer::TimestampZone::Utc)
+        ));
+    }
+
+    #[test]
+    fn hide_timestamps_flag_disables_timestamps() {
+        let cli = parse_args_from(args("--hide-timestamps -o - x.json")).unwrap();
+        assert!(matches!(cli.timestamps, renderer::TimestampDisplay::Hidden));
+
+        // Show then hide - last wins
+        let cli = parse_args_from(args("--show-timestamps --hide-timestamps -o - x.json")).unwrap();
+        assert!(matches!(cli.timestamps, renderer::TimestampDisplay::Hidden));
+    }
+
+    #[test]
+    fn hide_tools_flag_parsed() {
+        let cli = parse_args_from(args("--hide-tools -o - x.json")).unwrap();
+        assert!(matches!(cli.tools, renderer::Visibility::Hidden));
+    }
+
+    #[test]
+    fn errors_on_unknown_argument() {
+        let err = parse_args_from(args("--unknown-flag -o - x.json")).unwrap_err();
+        assert!(matches!(err, Error::ParseArgs { .. }));
+    }
 }

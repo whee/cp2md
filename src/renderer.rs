@@ -625,7 +625,7 @@ fn format_timestamp(dt: &DateTime<Utc>, zone: TimestampZone) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{ChatExport, Message, Request, ResponseElement};
+    use crate::parser::{ChatExport, ContextItem, Message, Request, ResponseElement};
     use chrono::{Local, TimeZone, Utc};
 
     const TS_MS: i64 = 1_733_356_800_000; // 2024-12-05 00:00:00 UTC
@@ -1329,5 +1329,54 @@ mod tests {
     fn extension_to_language_unknown_returns_empty() {
         assert_eq!(extension_to_language("/file.xyz"), "");
         assert_eq!(extension_to_language("/no_extension"), "");
+    }
+
+    #[test]
+    fn hides_model_and_agent_when_present_but_disabled() {
+        let mut req = make_request("Hi", vec![]);
+        req.agent_name = Some("workspace".into());
+        // make_request sets model_id = Some("claude-sonnet-4")
+
+        let chat = make_chat(vec![req]);
+        let opts = RenderOptions {
+            model: Visibility::Hidden,
+            agent: Visibility::Hidden,
+            ..Default::default()
+        };
+        let output = render_chat(&chat, &opts);
+
+        assert!(!output.contains("claude-sonnet-4"));
+        assert!(!output.contains("@workspace"));
+    }
+
+    #[test]
+    fn renders_single_line_selection_context() {
+        let mut req = make_request("Hi", vec![]);
+        req.context = vec![ContextItem::Selection {
+            name: "main.rs".into(),
+            path: "/src/main.rs".into(),
+            start_line: 42,
+            end_line: 42,
+        }];
+
+        let chat = make_chat(vec![req]);
+        let output = render_chat(&chat, &default_opts());
+
+        assert!(output.contains(":42 (selection)"));
+        assert!(!output.contains(":42-42"));
+    }
+
+    #[test]
+    fn renders_folder_context() {
+        let mut req = make_request("Hi", vec![]);
+        req.context = vec![ContextItem::Folder {
+            name: "src".into(),
+            path: "/project/src".into(),
+        }];
+
+        let chat = make_chat(vec![req]);
+        let output = render_chat(&chat, &default_opts());
+
+        assert!(output.contains("`src` (folder)"));
     }
 }

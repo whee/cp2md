@@ -923,4 +923,20 @@ mod tests {
 
         assert!(parse_chat(json).is_err());
     }
+
+    #[test]
+    fn handles_non_array_variables_gracefully() {
+        let json = r#"{
+            "responderUsername": "Copilot",
+            "requests": [{
+                "timestamp": 1733356800000,
+                "message": { "text": "Hi" },
+                "response": [],
+                "variableData": { "variables": "not-an-array" }
+            }]
+        }"#;
+
+        let chat = parse_chat(json).unwrap();
+        assert!(chat.requests[0].context.is_empty());
+    }
 }
