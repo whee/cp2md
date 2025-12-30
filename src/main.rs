@@ -7,6 +7,7 @@
 //! chat exports from JSON to Markdown format.
 
 use cp2md::{parser, renderer};
+use itertools::Itertools;
 use lexopt::prelude::*;
 use snafu::{OptionExt, ensure, prelude::*};
 use std::{
@@ -557,14 +558,10 @@ fn apply_output_plan(plan: OutputPlan, cli: &Cli) -> Result<(), Error> {
 
 /// Pure: renders multiple chats into a single concatenated output.
 fn render_concat(chats: &[parser::ChatExport], opts: &renderer::RenderOptions) -> String {
-    let mut output = String::new();
-    for (i, chat) in chats.iter().enumerate() {
-        if i > 0 {
-            output.push_str("\n---\n\n");
-        }
-        output.push_str(&renderer::render_chat(chat, opts));
-    }
-    output
+    chats
+        .iter()
+        .map(|chat| renderer::render_chat(chat, opts))
+        .join("\n---\n\n")
 }
 
 /// Processes multiple files and concatenates them into a single output.

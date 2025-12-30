@@ -45,6 +45,7 @@
 
 use crate::parser::{ChatExport, ContextItem, Request, ResponseElement};
 use chrono::{DateTime, Local, Utc};
+use itertools::Itertools;
 
 /// Timezone rendering selection for timestamps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,11 +199,8 @@ struct RenderedCodeBlock {
 impl Display for RenderedCodeBlock {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         writeln!(f, "```{}", self.lang)?;
-        for (i, edit) in self.edits.iter().enumerate() {
-            if i > 0 {
-                f.write_str("\n// ...\n\n")?;
-            }
-            f.write_str(edit)?;
+        for part in Itertools::intersperse(self.edits.iter().map(String::as_str), "\n// ...\n\n") {
+            f.write_str(part)?;
         }
         writeln!(f, "\n```")
     }
